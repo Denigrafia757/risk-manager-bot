@@ -29,21 +29,30 @@ function cloneDefaults() {
   return JSON.parse(JSON.stringify(DEFAULTS));
 }
 
-async function getSettings(env, chatId) {
-  if (!env.RISK_KV) return cloneDefaults();
-  const raw = await env.RISK_KV.get(`settings:${chatId}`);
-  if (!raw) return cloneDefaults();
-  try {
-    return { ...cloneDefaults(), ...JSON.parse(raw) };
-  } catch {
-    return cloneDefaults();
-  }
+function packState(s) {
+  // Compact callback payload; stays well below Telegram's 64-byte callback_data limit.
+  return [
+    Number(s.deposit), Number(s.risk), Number(s.leverage), Number(s.stopMove),
+    Number(s.winrate), Number(s.tp), Number(s.target),
+    Number(s.feeOpen), Number(s.feeClose),
+    s.scenario === "optimistic" ? 1 : s.scenario === "pessimistic" ? 2 : 0
+  ].join(":");
 }
 
-async function saveSettings(env, chatId, settings) {
-  if (env.RISK_KV) {
-    await env.RISK_KV.put(`settings:${chatId}`, JSON.stringify(settings));
-  }
+function unpackState(raw) {
+  const a = String(raw || "").split(":").map(Number);
+  if (a.length !== 10 || a.some(n => !Number.isFinite(n))) return cloneDefaults();
+  return {
+    deposit: a[0], risk: a[1], leverage: a[2], stopMove: a[3],
+    winrate: a[4], tp: a[5], target: a[6],
+    feeOpen: a[7], feeClose: a[8],
+    scenario: a[9] === 1 ? "optimistic" : a[9] === 2 ? "pessimistic" : "average"
+  };
+}
+
+function stateFromData(data) {
+  const parts = String(data || "").split(":");
+  return unpackState(parts.slice(1).join(":"));
 }
 
 async function tg(env, method, body) {
@@ -85,82 +94,94 @@ async function editMessage(env, chatId, messageId, text, replyMarkup) {
 }
 
 function mainKeyboard(s) {
+  const st = packState(s);
   return {
     inline_keyboard: [
       [
-        { text: `💰 Депозит: $${Number(s.deposit).toFixed(0)}`, callback_data: "menu:deposit" },
-        { text: `⚠️ Риск: ${s.risk}%`, callback_data: "menu:risk" },
+        { text: `💰 Депозит: $${s.deposit}`, callback_data: `menu:deposit:${st}` },
+        { text: `⚠️ Риск: ${s.risk}%`, callback_data: `menu:risk:${st}` }
       ],
       [
-        { text: `🔧 Плечо: ${s.leverage}x`, callback_data: "menu:leverage" },
-        { text: `🛑 Стоп: ${s.stopMove}%`, callback_data: "menu:stop" },
+        { text: `🔧 Плечо: ${s.leverage}x`, callback_data: `menu:leverage:${st}` },
+        { text: `🛑 Стоп: ${s.stopMove}%`, callback_data: `menu:stop:${st}` }
       ],
       [
-        { text: `🎯 Win Rate: ${s.winrate}%`, callback_data: "menu:winrate" },
-        { text: `📈 TP: ${s.tp}%`, callback_data: "menu:tp" },
+        { text: `🎯 Win Rate: ${s.winrate}%`, callback_data: `menu:winrate:${st}` },
+        { text: `📈 TP: ${s.tp}%`, callback_data: `menu:tp:${st}` }
       ],
       [
-        { text: `🏁 Цель: $${Number(s.target).toFixed(0)}`, callback_data: "menu:target" },
-        { text: BUTTONS.fees, callback_data: "menu:fees" },
+        { text: `🏁 Цель: $${s.target}`, callback_data: `menu:target:${st}` },
+        { text: `💸 Комиссия`, callback_data: `menu:fees:${st}` }
       ],
       [
-        { text: `📊 Сценарий: ${scenarioName(s)}`, callback_data: "menu:scenario" },
+        { text: `📊 ${scenarioName(s.scenario)}`, callback_data: `menu:scenario:${st}` }
       ],
       [
-        { text: "🧮 РАССЧИТАТЬ", callback_data: "calculate" },
+        { text: "⚡ $50 • 10% • 10x", callback_data: `preset:50:10:10:${st}` },
+        { text: "⚡ $100 • 10% • 10x", callback_data: `preset:100:10:10:${st}` }
       ],
       [
-        { text: "🔄 Сбросить", callback_data: "reset" },
+        { text: "⚡ $250 • 10% • 10x", callback_data: `preset:250:10:10:${st}` },
+        { text: "⚡ $500 • 5% • 10x", callback_data: `preset:500:5:10:${st}` }
       ],
-    ],
+      [
+        { text: "🧮 РАССЧИТАТЬ", callback_data: `calculate:${st}` }
+      ],
+      [
+        { text: "🔄 Сбросить", callback_data: "reset" }
+      ]
+    ]
   };
 }
 
-function valueKeyboard(title, field, values) {
+
+
+function valueKeyboard(title, field, values, s) {
+  const st = packState(s);
+  const buttons = values.map(v => ({
+    text: `${v}${field === "leverage" ? "x" : field === "deposit" || field === "target" ? "$" : "%"}`,
+    callback_data: `choose:${field}:${v}:${st}`
+  }));
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 3) rows.push(buttons.slice(i, i + 3));
+  rows.push([{ text: "⬅️ Назад", callback_data: `back:${st}` }]);
+  return { inline_keyboard: rows };
+}
+
+
+
+function presetKeyboard() { return { inline_keyboard: [] }; }
+
+
+
+function feesKeyboard(s) {
+  const st = packState(s);
   return {
     inline_keyboard: [
-      ...values.map(v => [{
-        text: `${v}${field === "deposit" || field === "target" ? " $" : field === "leverage" ? "x" : "%"}`,
-        callback_data: `choose:${field}:${v}`,
-      }]),
-      [{ text: "⬅️ Назад", callback_data: "back" }],
-    ],
+      [{ text: "Taker 0.055% / 0.055%", callback_data: `fees:taker:${st}` }],
+      [{ text: "Maker 0.020% / 0.020%", callback_data: `fees:maker:${st}` }],
+      [{ text: "0.010% / 0.010%", callback_data: `fees:low:${st}` }],
+      [{ text: "✏️ Своя комиссия", callback_data: `fees:custom:${st}` }],
+      [{ text: "⬅️ Назад", callback_data: `back:${st}` }]
+    ]
   };
 }
 
-function presetKeyboard() {
+
+
+function scenarioKeyboard(s) {
+  const st = packState(s);
   return {
     inline_keyboard: [
-      [{ text: "💵 $50 • 10% • 10x", callback_data: "preset:50:10:10" }],
-      [{ text: "💵 $100 • 10% • 10x", callback_data: "preset:100:10:10" }],
-      [{ text: "💵 $250 • 10% • 10x", callback_data: "preset:250:10:10" }],
-      [{ text: "💵 $500 • 5% • 10x", callback_data: "preset:500:5:10" }],
-      [{ text: "⬅️ Назад", callback_data: "back" }],
-    ],
+      [{ text: "📊 Средний", callback_data: `scenario:average:${st}` }],
+      [{ text: "🚀 Оптимистичный", callback_data: `scenario:optimistic:${st}` }],
+      [{ text: "🛡 Пессимистичный", callback_data: `scenario:pessimistic:${st}` }],
+      [{ text: "⬅️ Назад", callback_data: `back:${st}` }]
+    ]
   };
 }
 
-function feesKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: "Taker 0.055% / 0.055%", callback_data: "fees:taker" }],
-      [{ text: "Maker 0.020% / 0.020%", callback_data: "fees:maker" }],
-      [{ text: "Ввести свои", callback_data: "fees:custom" }],
-      [{ text: "⬅️ Назад", callback_data: "back" }],
-    ],
-  };
-}
 
-function scenarioKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: "📊 Средний", callback_data: "scenario:average" }],
-      [{ text: "🚀 Оптимистичный", callback_data: "scenario:optimistic" }],
-      [{ text: "🐻 Пессимистичный", callback_data: "scenario:pessimistic" }],
-      [{ text: "⬅️ Назад", callback_data: "back" }],
-    ],
-  };
-}
 
 function scenarioName(s) {
   return {
@@ -393,296 +414,113 @@ async function handleCallback(env, query) {
   const messageId = query.message.message_id;
   const data = query.data || "";
 
-  await tg(env, "answerCallbackQuery", {
-    callback_query_id: query.id,
-  });
-
-  if (data === "back") {
-    const s = await getSettings(env, chatId);
-    return editMessage(env, chatId, messageId, settingsText(s), mainKeyboard(s));
-  }
+  await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
 
   if (data === "reset") {
     const s = cloneDefaults();
-    await saveSettings(env, chatId, s);
-    if (env.RISK_KV) await env.RISK_KV.delete(`state:${chatId}`);
     return editMessage(env, chatId, messageId, settingsText(s), mainKeyboard(s));
   }
 
-  if (data === "calculate") {
-    const s = await getSettings(env, chatId);
-    const calc = calculate(s);
-    return editMessage(
-      env,
-      chatId,
-      messageId,
-      resultText(s, calc),
-      mainKeyboard(s)
-    );
-  }
+  // All menu/choice buttons carry the complete current state, so KV is not needed.
+  if (data.startsWith("menu:")) {
+    const [, menu, ...rest] = data.split(":");
+    const s = unpackState(rest.join(":"));
 
-  if (data === "menu:deposit") {
-    return editMessage(
-      env, chatId, messageId,
-      "💰 <b>Выбери депозит</b>\n\nНажми нужную сумму — вводить ничего не надо.",
-      valueKeyboard("Депозит", "deposit", [50, 100, 250, 500, 1000])
-    );
-  }
-
-  if (data === "menu:risk") {
-    return editMessage(
-      env, chatId, messageId,
-      "⚠️ <b>Риск на одну сделку</b>",
-      valueKeyboard("Риск", "risk", [1, 2, 5, 10, 15, 20])
-    );
-  }
-
-  if (data === "menu:leverage") {
-    return editMessage(
-      env, chatId, messageId,
-      "🔧 <b>Плечо</b>",
-      valueKeyboard("Плечо", "leverage", [5, 8, 10, 15, 20])
-    );
-  }
-
-  if (data === "menu:stop") {
-    return editMessage(
-      env, chatId, messageId,
-      "🛑 <b>Стоп по движению актива</b>",
-      valueKeyboard("Стоп", "stopMove", [4, 8, 10])
-    );
-  }
-
-  if (data === "menu:winrate") {
-    return editMessage(
-      env, chatId, messageId,
-      "🎯 <b>Win Rate</b>",
-      valueKeyboard("Win Rate", "winrate", [50, 60, 70, 80, 90, 100])
-    );
-  }
-
-  if (data === "menu:tp") {
-    return editMessage(
-      env, chatId, messageId,
-      "📈 <b>Take Profit</b>",
-      valueKeyboard("TP", "tp", [50, 100, 150, 200, 250, 300, 350, 400, 450, 500])
-    );
-  }
-
-  if (data === "menu:target") {
-    return editMessage(
-      env, chatId, messageId,
-      "🏁 <b>Целевой депозит</b>",
-      valueKeyboard("Цель", "target", [100, 250, 500, 1000, 5000, 10000])
-    );
-  }
-
-  if (data.startsWith("preset:")) {
-    const [, deposit, risk, leverage] = data.split(":");
-    const s = await getSettings(env, chatId);
-    s.deposit = Number(deposit);
-    s.risk = Number(risk);
-    s.leverage = Number(leverage);
-    await saveSettings(env, chatId, s);
-    return editMessage(env, chatId, messageId, settingsText(s), mainKeyboard(s));
+    if (menu === "deposit") return editMessage(env, chatId, messageId,
+      "💰 <b>Выбери депозит</b>", valueKeyboard("Депозит", "deposit", [50,100,250,500,1000], s));
+    if (menu === "risk") return editMessage(env, chatId, messageId,
+      "⚠️ <b>Риск на одну сделку</b>", valueKeyboard("Риск", "risk", [1,2,5,10,15,20], s));
+    if (menu === "leverage") return editMessage(env, chatId, messageId,
+      "🔧 <b>Плечо</b>", valueKeyboard("Плечо", "leverage", [5,8,10,15,20], s));
+    if (menu === "stop") return editMessage(env, chatId, messageId,
+      "🛑 <b>Стоп по движению актива</b>", valueKeyboard("Стоп", "stopMove", [4,8,10], s));
+    if (menu === "winrate") return editMessage(env, chatId, messageId,
+      "🎯 <b>Win Rate</b>", valueKeyboard("Win Rate", "winrate", [50,60,70,80,90,100], s));
+    if (menu === "tp") return editMessage(env, chatId, messageId,
+      "📈 <b>Take Profit</b>", valueKeyboard("TP", "tp", [50,100,150,200,250,300,350,400,450,500], s));
+    if (menu === "target") return editMessage(env, chatId, messageId,
+      "🏁 <b>Целевой депозит</b>", valueKeyboard("Цель", "target", [100,250,500,1000,5000,10000], s));
+    if (menu === "fees") return editMessage(env, chatId, messageId,
+      "💸 <b>Комиссия</b>\n\nВыбери тариф:", feesKeyboard(s));
+    if (menu === "scenario") return editMessage(env, chatId, messageId,
+      "📊 <b>Сценарий распределения сделок</b>", scenarioKeyboard(s));
   }
 
   if (data.startsWith("choose:")) {
-    const [, field, rawValue] = data.split(":");
-    const value = Number(rawValue);
-    const s = await getSettings(env, chatId);
-
-    if (!Number.isFinite(value)) {
-      return editMessage(env, chatId, messageId, "❌ Некорректное значение.", mainKeyboard(s));
-    }
-
+    const parts = data.split(":");
+    const field = parts[1];
+    const value = Number(parts[2]);
+    const s = unpackState(parts.slice(3).join(":"));
     if (!valid(field, String(value))) {
       return editMessage(env, chatId, messageId, "❌ Некорректное значение.", mainKeyboard(s));
     }
-
     s[field] = value;
-    await saveSettings(env, chatId, s);
-
-    return editMessage(
-      env,
-      chatId,
-      messageId,
-      settingsText(s),
-      mainKeyboard(s)
-    );
-  }
-
-  if (data === "menu:fees") {
-    return editMessage(
-      env,
-      chatId,
-      messageId,
-      "💸 <b>Комиссия</b>\n\nВыбери готовый вариант или введи свои значения.",
-      feesKeyboard()
-    );
-  }
-
-  if (data === "menu:scenario") {
-    return editMessage(
-      env,
-      chatId,
-      messageId,
-      "📊 <b>Сценарий распределения сделок</b>",
-      scenarioKeyboard()
-    );
-  }
-
-  if (data === "fees:taker" || data === "fees:maker") {
-    const s = await getSettings(env, chatId);
-    if (data === "fees:taker") {
-      s.feeOpen = 0.055;
-      s.feeClose = 0.055;
-    } else {
-      s.feeOpen = 0.020;
-      s.feeClose = 0.020;
-    }
-    await saveSettings(env, chatId, s);
     return editMessage(env, chatId, messageId, settingsText(s), mainKeyboard(s));
   }
 
-  if (data === "fees:custom") {
-    if (!env.RISK_KV) {
-      return editMessage(
-        env,
-        chatId,
-        messageId,
-        "KV не подключён. Для своих комиссий используй готовый тариф.",
-        feesKeyboard()
-      );
+  if (data.startsWith("preset:")) {
+    const parts = data.split(":");
+    const s = unpackState(parts.slice(4).join(":"));
+    s.deposit = Number(parts[1]); s.risk = Number(parts[2]); s.leverage = Number(parts[3]);
+    return editMessage(env, chatId, messageId, settingsText(s), mainKeyboard(s));
+  }
+
+  if (data.startsWith("fees:")) {
+    const parts = data.split(":");
+    const s = unpackState(parts.slice(2).join(":"));
+    const kind = parts[1];
+    if (kind === "taker") { s.feeOpen = 0.055; s.feeClose = 0.055; }
+    else if (kind === "maker") { s.feeOpen = 0.020; s.feeClose = 0.020; }
+    else if (kind === "low") { s.feeOpen = 0.010; s.feeClose = 0.010; }
+    else if (kind === "custom") {
+      return editMessage(env, chatId, messageId,
+        "✏️ Своя комиссия\n\nОтправь одной строкой: <code>0.055 0.055</code>\nПервое число — открытие, второе — закрытие.\n\nПосле ввода нажми /start и выбери параметры заново.");
     }
-    await env.RISK_KV.put(
-      `state:${chatId}`,
-      JSON.stringify({ field: "feeOpen" })
-    );
-    return editMessage(env, chatId, messageId, promptText("feeOpen"));
+    return editMessage(env, chatId, messageId, settingsText(s), mainKeyboard(s));
   }
 
   if (data.startsWith("scenario:")) {
-    const s = await getSettings(env, chatId);
-    s.scenario = data.split(":")[1];
-    await saveSettings(env, chatId, s);
+    const parts = data.split(":");
+    const s = unpackState(parts.slice(2).join(":"));
+    s.scenario = parts[1];
     return editMessage(env, chatId, messageId, settingsText(s), mainKeyboard(s));
   }
 
-  if (data.startsWith("set:")) {
-    const field = data.slice(4);
+  if (data.startsWith("calculate:")) {
+    const s = unpackState(data.slice("calculate:".length));
+    return editMessage(env, chatId, messageId, resultText(s, calculate(s)), mainKeyboard(s));
+  }
 
-    if (!env.RISK_KV) {
-      return sendMessage(
-        env,
-        chatId,
-        "⚠️ KV не подключён. Но быстрый расчёт одной строкой работает.\n\nПример:\n<code>50 10 10 200 300</code>"
-      );
-    }
-
-    await env.RISK_KV.put(
-      `state:${chatId}`,
-      JSON.stringify({ field })
-    );
-
-    return editMessage(env, chatId, messageId, promptText(field));
+  if (data.startsWith("back:")) {
+    const s = unpackState(data.slice(5));
+    return editMessage(env, chatId, messageId, settingsText(s), mainKeyboard(s));
   }
 }
 
 async function handleMessage(env, message) {
   const chatId = message.chat.id;
-  const text = (message.text || "").trim();
+  const text = String(message.text || "").trim();
 
-  if (text === "/start") {
-    const s = await getSettings(env, chatId);
-    return sendMessage(
-      env,
-      chatId,
-      "<b>📊 Риск-менеджер</b>\n\nНичего вводить вручную не нужно.\nВыбирай параметры кнопками ниже.",
-      mainKeyboard(s)
-    );
+  if (text === "/start" || text === "/reset") {
+    const s = cloneDefaults();
+    return sendMessage(env, chatId, settingsText(s), mainKeyboard(s));
   }
 
   if (text === "/calc") {
-    const s = await getSettings(env, chatId);
-    return sendMessage(
-      env,
-      chatId,
-      "<b>🧮 Настройка сделки</b>\n\nВыбирай всё кнопками. После выбора нажми «Рассчитать».",
-      mainKeyboard(s)
+    return sendMessage(env, chatId,
+      "Используй кнопки ниже — все основные параметры выбираются без ручного ввода.",
+      mainKeyboard(cloneDefaults())
     );
   }
 
-  if (text === "/help") {
-    const s = await getSettings(env, chatId);
-    return sendMessage(
-      env,
-      chatId,
-      "<b>Помощь</b>\n\nВсе основные параметры выбираются кнопками.\nМожно изменить депозит, риск, плечо, стоп, Win Rate, TP и цель.",
-      mainKeyboard(s)
-    );
-  }
+  const nums = parseNumbers(text);
+  const quick = quickCalculationText(nums);
+  if (quick) return sendMessage(env, chatId, quick);
 
-  // Quick calculation works even without KV.
-  const quick = quickCalculationText(parseNumbers(text));
-  if (quick) {
-    return sendMessage(env, chatId, quick, mainKeyboard(await getSettings(env, chatId)));
-  }
-
-  if (!env.RISK_KV) {
-    return sendMessage(
-      env,
-      chatId,
-      "Не понял сообщение.\n\nПример расчёта:\n<code>50 10 10 200 300</code>"
-    );
-  }
-
-  const stateRaw = await env.RISK_KV.get(`state:${chatId}`);
-
-  if (!stateRaw) {
-    return sendMessage(
-      env,
-      chatId,
-      "Используй кнопки после /start или отправь 5 чисел одной строкой.\n\nПример:\n<code>50 10 10 200 300</code>",
-      mainKeyboard(await getSettings(env, chatId))
-    );
-  }
-
-  let state;
-  try {
-    state = JSON.parse(stateRaw);
-  } catch {
-    await env.RISK_KV.delete(`state:${chatId}`);
-    return sendMessage(env, chatId, "Состояние сброшено. Нажми /start.");
-  }
-
-  const field = state.field;
-
-  if (!valid(field, text)) {
-    return sendMessage(
-      env,
-      chatId,
-      `${promptText(field)}\n\n❌ Некорректное значение.`
-    );
-  }
-
-  const s = await getSettings(env, chatId);
-  const value = Number(text.replace(",", "."));
-
-  if (field === "feeOpen") {
-    s.feeOpen = value;
-    await env.RISK_KV.put(
-      `state:${chatId}`,
-      JSON.stringify({ field: "feeClose" })
-    );
-    return sendMessage(env, chatId, promptText("feeClose"));
-  }
-
-  s[field] = value;
-  await saveSettings(env, chatId, s);
-  await env.RISK_KV.delete(`state:${chatId}`);
-
-  return sendMessage(env, chatId, settingsText(s), mainKeyboard(s));
+  return sendMessage(env, chatId,
+    "Выбери параметры кнопками ниже.",
+    mainKeyboard(cloneDefaults())
+  );
 }
 
 async function setWebhook(env, request) {
