@@ -675,7 +675,7 @@ async function handleCallback(env, query) {
   if (data === "diary:chart:pnl") {
     const d=await personalChartData(env,chatId);
     if(!d.count) return editMessage(env,chatId,messageId,"<b>📊 График P/L</b>\n\nСначала добавь хотя бы одну сделку.",diaryKeyboard());
-    const svg=chartSvg("Кривая P/L","Фактические сделки · накопительный P/L",d.balance,d.labels,{money:true});
+    const svg=chartSvg("Кривая P/L","Фактические сделки · накопительный P/L",d.pnl,d.labels,{money:true});
     await sendSvg(env,chatId,svg,"pnl_chart.svg","📊 График накопительного P/L");
     return;
   }

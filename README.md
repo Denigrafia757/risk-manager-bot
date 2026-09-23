@@ -1,9 +1,3 @@
-Risk Manager Telegram Bot
+# Risk Manager Telegram
 
-Files:
-- index.js
-- wrangler.toml
-
-The bot contains a risk calculator, calculated-trade pages, and a private per-Telegram-chat trading diary.
-
-For persistent diary storage, connect a Cloudflare D1 database to the Worker with the binding variable name: DB.
+Telegram risk-management calculator with a private trading journal, statistics, charts and CSV export.
