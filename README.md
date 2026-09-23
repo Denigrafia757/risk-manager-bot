@@ -1,22 +1,27 @@
 # Risk Manager Telegram Bot
 
-Файлы специально находятся в корне репозитория — без папок.
+Файлы находятся прямо в корне архива — без папок.
 
 ## Файлы
-- index.js — код Cloudflare Worker
-- wrangler.toml — конфигурация Worker и KV
+- index.js
+- wrangler.toml
+- README.md
 
-## Что понадобится
-1. GitHub repository.
-2. Cloudflare Workers.
-3. Cloudflare KV Namespace.
-4. Telegram Bot Token.
+## Важно после загрузки
+1. Убедись, что Secret `BOT_TOKEN` уже есть в Cloudflare Worker.
+2. Если используешь KV для кнопочного режима, binding должен называться `RISK_KV`.
+3. После деплоя открой в браузере:
+   `https://risk-manager-telegram.danzeldan.workers.dev/set-webhook`
+4. После этого открой:
+   `https://risk-manager-telegram.danzeldan.workers.dev/webhook-info`
+   и проверь, что URL webhook указывает на этот Worker.
 
-## Важно
-Telegram BOT_TOKEN не записывается в GitHub. Его нужно добавить в Cloudflare как Secret с именем `BOT_TOKEN`.
+## Быстрый расчёт
+Можно отправить боту одну строку:
 
-После создания KV Namespace скопируй его ID и замени:
-REPLACE_WITH_KV_NAMESPACE_ID
-в файле wrangler.toml.
+`50 10 10 200 300`
 
-После деплоя нужно установить Telegram webhook на URL Worker.
+Порядок:
+депозит → риск % → стоп % → плечо → Take Profit %.
+
+Быстрый расчёт работает даже без KV.
