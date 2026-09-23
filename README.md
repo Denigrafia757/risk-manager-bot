@@ -1,18 +1,22 @@
-# Risk Manager Bot
+# Risk Manager Telegram Bot
 
-Telegram risk-management calculator running on Cloudflare Workers.
+Файлы специально находятся в корне репозитория — без папок.
 
-## Files
+## Файлы
+- index.js — код Cloudflare Worker
+- wrangler.toml — конфигурация Worker и KV
 
-- index.js — основной код бота
-- wrangler.toml — настройки Cloudflare Worker
+## Что понадобится
+1. GitHub repository.
+2. Cloudflare Workers.
+3. Cloudflare KV Namespace.
+4. Telegram Bot Token.
 
-## GitHub upload
+## Важно
+Telegram BOT_TOKEN не записывается в GitHub. Его нужно добавить в Cloudflare как Secret с именем `BOT_TOKEN`.
 
-Загружать файлы прямо в корень репозитория `risk-manager-bot`.
-Папки создавать не нужно.
+После создания KV Namespace скопируй его ID и замени:
+REPLACE_WITH_KV_NAMESPACE_ID
+в файле wrangler.toml.
 
-## Important
-
-Перед публикацией замените `PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE`
-на токен вашего Telegram-бота.
+После деплоя нужно установить Telegram webhook на URL Worker.
