@@ -113,53 +113,90 @@ async function diaryStats(env, chatId) {
 function csvEscape(v) { return `"${String(v ?? "").replace(/"/g,'""')}"`; }
 
 
-function escXml(v) {
-  return String(v ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+function chartConfig(title, labels, values) {
+  return {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: title,
+        data: values,
+        borderColor: "#22c55e",
+        backgroundColor: "rgba(34,197,94,0.10)",
+        borderWidth: 3,
+        pointRadius: values.length > 60 ? 0 : 3,
+        pointHoverRadius: 5,
+        fill: true,
+        tension: 0.18,
+      }],
+    },
+    options: {
+      responsive: false,
+      animation: false,
+      plugins: {
+        legend: { display: false },
+        title: {
+          display: true,
+          text: title,
+          color: "#f8fafc",
+          font: { size: 24, weight: "700" },
+        },
+      },
+      scales: {
+        x: {
+          ticks: { color: "#94a3b8", maxTicksLimit: 9 },
+          grid: { color: "#263044" },
+        },
+        y: {
+          ticks: {
+            color: "#94a3b8",
+            callback: (value) => "$" + Number(value).toFixed(2),
+          },
+          grid: { color: "#263044" },
+        },
+      },
+    },
+  };
 }
 
-function chartSvg(title, subtitle, values, labels, opts={}) {
-  const W=1100,H=620,L=90,R=45,T=95,B=90;
-  const pw=W-L-R, ph=H-T-B;
-  const vals=values.map(Number).filter(Number.isFinite);
-  if(!vals.length) return null;
-  const min=Math.min(...vals), max=Math.max(...vals);
-  const pad=(max-min || Math.max(Math.abs(max),1)*0.12);
-  const lo=min-pad*0.08, hi=max+pad*0.08;
-  const x=i=>L+(vals.length===1?pw/2:(i/(vals.length-1))*pw);
-  const y=v=>T+(hi-v)/(hi-lo)*ph;
-  const pts=vals.map((v,i)=>`${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
-  const area=`${L},${T+ph} ${pts} ${x(vals.length-1)},${T+ph}`;
-  const grid=[];
-  for(let i=0;i<=4;i++){
-    const v=lo+(hi-lo)*i/4, yy=y(v);
-    grid.push(`<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="#263044" stroke-width="1"/><text x="${L-14}" y="${yy+5}" fill="#94a3b8" font-size="18" text-anchor="end">${escXml((opts.money?"$":"")+v.toFixed(2))}</text>`);
+async function sendChartPhoto(env, chatId, title, subtitle, labels, values, backCallback) {
+  const response = await fetch("https://quickchart.io/chart", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      width: 1100,
+      height: 620,
+      format: "png",
+      backgroundColor: "#0b0f17",
+      chart: chartConfig(title, labels, values),
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`QuickChart HTTP ${response.status}`);
   }
-  const step=Math.max(1,Math.ceil(labels.length/8));
-  const xlabels=[];
-  labels.forEach((lab,i)=>{ if(i===0 || i===labels.length-1 || i%step===0) xlabels.push(`<text x="${x(i)}" y="${H-42}" fill="#94a3b8" font-size="17" text-anchor="middle">${escXml(lab)}</text>`); });
-  const dots=vals.map((v,i)=>`<circle cx="${x(i)}" cy="${y(v)}" r="4.5" fill="#22c55e"/>`).join("");
-  const zero=(lo<0&&hi>0)?`<line x1="${L}" y1="${y(0)}" x2="${W-R}" y2="${y(0)}" stroke="#64748b" stroke-dasharray="6 6"/>`:"";
-  return `<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
-  <rect width="100%" height="100%" rx="28" fill="#0b0f17"/>
-  <text x="${L}" y="48" fill="#f8fafc" font-family="Arial,sans-serif" font-size="30" font-weight="700">${escXml(title)}</text>
-  <text x="${L}" y="75" fill="#94a3b8" font-family="Arial,sans-serif" font-size="17">${escXml(subtitle)}</text>
-  ${grid.join("")}${zero}
-  <polygon points="${area}" fill="#22c55e" opacity="0.10"/>
-  <polyline points="${pts}" fill="none" stroke="#22c55e" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>
-  ${dots}${xlabels.join("")}
-  <text x="${W-R}" y="${H-15}" fill="#64748b" font-family="Arial,sans-serif" font-size="14" text-anchor="end">Risk Manager</text>
-  </svg>`;
-}
 
-async function sendSvg(env, chatId, svg, filename, caption) {
-  const blob=new Blob([svg],{type:"image/svg+xml"});
-  const form=new FormData();
-  form.append("chat_id",String(chatId));
-  form.append("document",blob,filename);
-  if(caption) form.append("caption",caption);
-  const response=await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendDocument`,{method:"POST",body:form});
-  const data=await response.json().catch(()=>({}));
-  if(!response.ok||!data.ok) throw new Error(`Telegram sendDocument: ${JSON.stringify(data)}`);
+  const image = await response.blob();
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("photo", image, "risk-manager-chart.png");
+  form.append("caption", `📈 <b>${title}</b>\n${subtitle}`);
+  form.append("parse_mode", "HTML");
+
+  if (backCallback) {
+    form.append("reply_markup", JSON.stringify({
+      inline_keyboard: [[{ text: "⬅️ Назад", callback_data: backCallback }]],
+    }));
+  }
+
+  const tgResponse = await fetch(
+    `https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`,
+    { method: "POST", body: form }
+  );
+  const data = await tgResponse.json().catch(() => ({}));
+  if (!tgResponse.ok || !data.ok) {
+    throw new Error(`Telegram sendPhoto: ${JSON.stringify(data)}`);
+  }
 }
 
 async function personalChartData(env, chatId) {
@@ -667,16 +704,14 @@ async function handleCallback(env, query) {
   if (data === "diary:chart:balance") {
     const d=await personalChartData(env,chatId);
     if(!d.count) return editMessage(env,chatId,messageId,"<b>📈 График депозита</b>\n\nСначала добавь хотя бы одну сделку.",diaryKeyboard());
-    const svg=chartSvg("График баланса","Фактические сделки · накопительный результат",d.balance,d.labels,{money:true});
-    await sendSvg(env,chatId,svg,"balance_chart.svg","📈 График баланса твоих сделок");
+    await sendChartPhoto(env, chatId, "График баланса", "Фактические сделки · накопительный результат", d.labels, d.balance, "diary:menu");
     return;
   }
 
   if (data === "diary:chart:pnl") {
     const d=await personalChartData(env,chatId);
     if(!d.count) return editMessage(env,chatId,messageId,"<b>📊 График P/L</b>\n\nСначала добавь хотя бы одну сделку.",diaryKeyboard());
-    const svg=chartSvg("Кривая P/L","Фактические сделки · накопительный P/L",d.pnl,d.labels,{money:true});
-    await sendSvg(env,chatId,svg,"pnl_chart.svg","📊 График накопительного P/L");
+    await sendChartPhoto(env, chatId, "Кривая P/L", "Фактические сделки · накопительный P/L", d.labels, d.pnl, "diary:menu");
     return;
   }
 
@@ -760,8 +795,7 @@ async function handleCallback(env, query) {
   if (data.startsWith("calcchart:")) {
     const s=unpackState(data.slice("calcchart:".length));
     const d=calcChartData(s);
-    const svg=chartSvg("График депозита","Сценарий Risk Management · расчётные сделки",d.values,d.labels,{money:true});
-    await sendSvg(env,chatId,svg,"risk_management_chart.svg","📈 График расчётного депозита");
+    await sendChartPhoto(env, chatId, "График расчётного депозита", "Сценарий Risk Management · расчётные сделки", d.labels, d.values, `trades:0:${packState(s)}`);
     return;
   }
 
