@@ -104,6 +104,9 @@ function mainKeyboard(s) {
         { text: BUTTONS.fees, callback_data: "menu:fees" },
       ],
       [
+        { text: `📊 Сценарий: ${scenarioName(s)}`, callback_data: "menu:scenario" },
+      ],
+      [
         { text: "🧮 РАССЧИТАТЬ", callback_data: "calculate" },
       ],
       [
@@ -641,7 +644,7 @@ async function handleMessage(env, message) {
       env,
       chatId,
       "Используй кнопки после /start или отправь 5 чисел одной строкой.\n\nПример:\n<code>50 10 10 200 300</code>",
-      mainKeyboard(s)
+      mainKeyboard(await getSettings(env, chatId))
     );
   }
 
