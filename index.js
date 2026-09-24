@@ -209,10 +209,10 @@ function fromB64(s) {
 }
 
 async function deriveStorageKey(env) {
-  if (!env.BOT_TOKEN) throw new Error("BOT_TOKEN is missing");
-  const seed = new TextEncoder().encode(`risk-manager-bybit-v1:${env.BOT_TOKEN}`);
-  const digest = await crypto.subtle.digest("SHA-256", seed);
-  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+  if (!env.BYBIT_ENCRYPTION_KEY) throw new Error("BYBIT_ENCRYPTION_KEY is missing");
+  const raw = fromB64(env.BYBIT_ENCRYPTION_KEY);
+  if (raw.byteLength !== 32) throw new Error("BYBIT_ENCRYPTION_KEY must be a base64-encoded 32-byte key");
+  return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
 }
 
 async function encryptSecret(env, value) {
