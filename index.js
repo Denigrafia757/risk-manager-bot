@@ -163,8 +163,8 @@ function chartConfig(title, labels, values, colorByChange = false) {
         title: { display: true, text: title, color: "#f8fafc", font: { size: 24, weight: "700" } },
       },
       scales: {
-        x: { ticks: { color: "#ffffff", maxTicksLimit: 9, font: { size: 14, weight: "600" } }, grid: { color: "#263044" } },
-        y: { ticks: { color: "#ffffff", callback: "__Y_TICK__", font: { size: 14, weight: "600" } }, grid: { color: "#263044" } },
+        x: { ticks: { color: "#ffffff", maxTicksLimit: 9 }, grid: { color: "#263044" } },
+        y: { ticks: { color: "#ffffff", callback: "__Y_TICK__" }, grid: { color: "#263044" } },
       },
     },
   };
@@ -604,6 +604,28 @@ function promptText(field) {
   return names[field] || "Введи значение:";
 }
 
+function customPrompt(field) {
+  const hints = {
+    deposit: "целое число от <b>$10</b> до <b>$10 000</b> (например <code>347</code>)",
+    risk: "от <b>0.01%</b> до <b>100%</b> (например <code>2.5</code>)",
+    leverage: "от <b>0.1x</b> до <b>1000x</b> (например <code>12.5</code>)",
+    stopMove: "от <b>0.01%</b> до <b>100%</b> (например <code>3.5</code>)",
+    winrate: "от <b>0%</b> до <b>100%</b> (например <code>67</code>)",
+    tp: "от <b>0%</b> и выше (например <code>275</code> или <code>275.5</code>)",
+    target: "положительное число в $ (например <code>2500</code>)",
+  };
+  return `✏️ <b>Своё значение</b>
+
+${promptText(field)}
+
+Диапазон: ${hints[field] || "введи число"}.
+Можно использовать точку или запятую для дробного значения.`;
+}
+
+function customKeyboard(s) {
+  return { inline_keyboard: [[{ text: "❌ Отмена", callback_data: `back:${packState(s)}` }]] };
+}
+
 function valid(field, value) {
   const n = Number(String(value).replace(",", "."));
   if (!Number.isFinite(n)) return false;
@@ -717,14 +739,24 @@ async function handleCallback(env, query) {
   if (data === "diary:chart:balance") {
     const d=await personalChartData(env,chatId);
     if(!d.count) return editMessage(env,chatId,messageId,"<b>📈 График депозита</b>\n\nСначала добавь хотя бы одну сделку.",diaryKeyboard());
-    await sendChartPhoto(env, chatId, "График баланса", "🟢 прибыльная сделка · 🔴 убыточная сделка", d.labels, d.balance, "diary:menu", true);
+    try {
+      await sendChartPhoto(env, chatId, "График баланса", "🟢 прибыльная сделка · 🔴 убыточная сделка", d.labels, d.balance, "diary:menu", true);
+    } catch (e) {
+      console.error("DIARY_BALANCE_CHART", e);
+      await sendMessage(env, chatId, "❌ Не удалось построить график. Нажми кнопку ещё раз.", diaryKeyboard());
+    }
     return;
   }
 
   if (data === "diary:chart:pnl") {
     const d=await personalChartData(env,chatId);
     if(!d.count) return editMessage(env,chatId,messageId,"<b>📊 График P/L</b>\n\nСначала добавь хотя бы одну сделку.",diaryKeyboard());
-    await sendChartPhoto(env, chatId, "Кривая P/L", "Фактические сделки · накопительный P/L", d.labels, d.pnl, "diary:menu");
+    try {
+      await sendChartPhoto(env, chatId, "Кривая P/L", "Фактические сделки · накопительный P/L", d.labels, d.pnl, "diary:menu");
+    } catch (e) {
+      console.error("DIARY_PNL_CHART", e);
+      await sendMessage(env, chatId, "❌ Не удалось построить график. Нажми кнопку ещё раз.", diaryKeyboard());
+    }
     return;
   }
 
@@ -742,6 +774,16 @@ async function handleCallback(env, query) {
       { inline_keyboard: [[{ text: "❌ Отмена", callback_data: `back:${packState(s)}` }]] });
   }
 
+  if (data.startsWith("custom:")) {
+    const parts = data.split(":");
+    const field = parts[1];
+    const s = unpackState(parts.slice(2).join(":"));
+    const allowed = ["deposit","risk","leverage","stopMove","winrate","tp","target"];
+    if (!allowed.includes(field)) return editMessage(env, chatId, messageId, "❌ Неизвестный параметр.", mainKeyboard(s));
+    await saveCalcInputState(env, chatId, { step: field, state: s });
+    return editMessage(env, chatId, messageId, customPrompt(field), customKeyboard(s));
+  }
+
   // All menu/choice buttons carry the complete current state, so KV is not needed.
   if (data.startsWith("menu:")) {
     const [, menu, ...rest] = data.split(":");
@@ -753,18 +795,36 @@ async function handleCallback(env, query) {
       return editMessage(env, chatId, messageId,
         "💰 <b>Депозит</b>\n\nВыбери сумму или введи свою.\nДиапазон: <b>$10–$10 000</b>, с шагом $1.", kb);
     }
-    if (menu === "risk") return editMessage(env, chatId, messageId,
-      "⚠️ <b>Риск на одну сделку</b>", valueKeyboard("Риск", "risk", [1,2,5,10,15,20], s));
-    if (menu === "leverage") return editMessage(env, chatId, messageId,
-      "🔧 <b>Плечо</b>", valueKeyboard("Плечо", "leverage", [5,8,10,15,20], s));
-    if (menu === "stop") return editMessage(env, chatId, messageId,
-      "🛑 <b>Стоп по движению актива</b>", valueKeyboard("Стоп", "stopMove", [4,8,10], s));
-    if (menu === "winrate") return editMessage(env, chatId, messageId,
-      "🎯 <b>Win Rate</b>", valueKeyboard("Win Rate", "winrate", [50,60,70,80,90,100], s));
-    if (menu === "tp") return editMessage(env, chatId, messageId,
-      "📈 <b>Take Profit</b>", valueKeyboard("TP", "tp", [50,100,150,200,250,300,350,400,450,500], s));
-    if (menu === "target") return editMessage(env, chatId, messageId,
-      "🏁 <b>Целевой депозит</b>", valueKeyboard("Цель", "target", [100,250,500,1000,5000,10000], s));
+    if (menu === "risk") {
+      const kb = valueKeyboard("Риск", "risk", [1,2,5,10,15,20], s);
+      kb.inline_keyboard.splice(-1, 0, [{ text: "✏️ Ввести своё значение", callback_data: `custom:risk:${packState(s)}` }]);
+      return editMessage(env, chatId, messageId, "⚠️ <b>Риск на одну сделку</b>\n\nВыбери готовое значение или введи своё.", kb);
+    }
+    if (menu === "leverage") {
+      const kb = valueKeyboard("Плечо", "leverage", [5,8,10,15,20], s);
+      kb.inline_keyboard.splice(-1, 0, [{ text: "✏️ Ввести своё значение", callback_data: `custom:leverage:${packState(s)}` }]);
+      return editMessage(env, chatId, messageId, "🔧 <b>Плечо</b>\n\nВыбери готовое значение или введи своё.", kb);
+    }
+    if (menu === "stop") {
+      const kb = valueKeyboard("Стоп", "stopMove", [4,8,10], s);
+      kb.inline_keyboard.splice(-1, 0, [{ text: "✏️ Ввести своё значение", callback_data: `custom:stopMove:${packState(s)}` }]);
+      return editMessage(env, chatId, messageId, "🛑 <b>Стоп по движению актива</b>\n\nВыбери готовое значение или введи своё.", kb);
+    }
+    if (menu === "winrate") {
+      const kb = valueKeyboard("Win Rate", "winrate", [50,60,70,80,90,100], s);
+      kb.inline_keyboard.splice(-1, 0, [{ text: "✏️ Ввести своё значение", callback_data: `custom:winrate:${packState(s)}` }]);
+      return editMessage(env, chatId, messageId, "🎯 <b>Win Rate</b>\n\nВыбери готовое значение или введи своё.", kb);
+    }
+    if (menu === "tp") {
+      const kb = valueKeyboard("TP", "tp", [50,100,150,200,250,300,350,400,450,500], s);
+      kb.inline_keyboard.splice(-1, 0, [{ text: "✏️ Ввести своё значение", callback_data: `custom:tp:${packState(s)}` }]);
+      return editMessage(env, chatId, messageId, "📈 <b>Take Profit</b>\n\nВыбери готовое значение или введи своё.", kb);
+    }
+    if (menu === "target") {
+      const kb = valueKeyboard("Цель", "target", [100,250,500,1000,5000,10000], s);
+      kb.inline_keyboard.splice(-1, 0, [{ text: "✏️ Ввести своё значение", callback_data: `custom:target:${packState(s)}` }]);
+      return editMessage(env, chatId, messageId, "🏁 <b>Целевой депозит</b>\n\nВыбери готовое значение или введи своё.", kb);
+    }
     if (menu === "fees") return editMessage(env, chatId, messageId,
       "💸 <b>Комиссия</b>\n\nВыбери тариф:", feesKeyboard(s));
     if (menu === "scenario") return editMessage(env, chatId, messageId,
@@ -798,8 +858,9 @@ async function handleCallback(env, query) {
     else if (kind === "maker") { s.feeOpen = 0.020; s.feeClose = 0.020; }
     else if (kind === "low") { s.feeOpen = 0.010; s.feeClose = 0.010; }
     else if (kind === "custom") {
+      await saveCalcInputState(env, chatId, { step: "fees", state: s });
       return editMessage(env, chatId, messageId,
-        "✏️ Своя комиссия\n\nОтправь одной строкой: <code>0.055 0.055</code>\nПервое число — открытие, второе — закрытие.\n\nПосле ввода нажми /start и выбери параметры заново.");
+        "✏️ <b>Своя комиссия</b>\n\nОтправь одной строкой: <code>0.055 0.055</code>\nПервое число — открытие, второе — закрытие.\nМожно использовать дробные значения и запятую.", customKeyboard(s));
     }
     return editMessage(env, chatId, messageId, settingsText(s), mainKeyboard(s));
   }
@@ -820,7 +881,12 @@ async function handleCallback(env, query) {
   if (data.startsWith("calcchart:")) {
     const s=unpackState(data.slice("calcchart:".length));
     const d=calcChartData(s);
-    await sendChartPhoto(env, chatId, "График расчётного депозита", "🟢 прибыльная сделка · 🔴 убыточная сделка", d.labels, d.values, `trades:0:${packState(s)}`, true);
+    try {
+      await sendChartPhoto(env, chatId, "График расчётного депозита", "🟢 прибыльная сделка · 🔴 убыточная сделка", d.labels, d.values, `trades:0:${packState(s)}`, true);
+    } catch (e) {
+      console.error("CALC_CHART", e);
+      await sendMessage(env, chatId, "❌ Не удалось построить график. Нажми кнопку ещё раз.", tradesKeyboard(s, 0, calculate(s).rows.length));
+    }
     return;
   }
 
@@ -870,16 +936,31 @@ async function handleMessage(env, message) {
   }
 
   const calcInputState = await getCalcInputState(env, chatId).catch(() => null);
-  if (calcInputState?.step === "deposit") {
-    const normalized = text.replace(/[$₽\s]/g, "").replace(",", ".");
-    const n = Number(normalized);
-    if (!Number.isInteger(n) || n < 10 || n > 10000) {
-      return sendMessage(env, chatId,
-        "❌ Неверная сумма. Введи <b>целое число от $10 до $10 000</b>.\nНапример: <code>347</code>.",
-        { inline_keyboard: [[{ text: "❌ Отмена", callback_data: `back:${packState(calcInputState.state || cloneDefaults())}` }]] });
-    }
+  if (calcInputState?.step) {
+    const field = calcInputState.step;
     const s = calcInputState.state || cloneDefaults();
-    s.deposit = n;
+
+    if (field === "fees") {
+      const nums = parseNumbers(text);
+      if (nums.length < 2 || nums[0] < 0 || nums[1] < 0) {
+        return sendMessage(env, chatId,
+          "❌ Некорректная комиссия.\n\nВведи две комиссии через пробел, например: <code>0.055 0.055</code>.",
+          customKeyboard(s));
+      }
+      s.feeOpen = nums[0];
+      s.feeClose = nums[1];
+      await deleteCalcInputState(env, chatId);
+      return sendMessage(env, chatId, settingsText(s), mainKeyboard(s));
+    }
+
+    const normalized = text.replace(/[$₽%xX\s]/g, "").replace(",", ".");
+    const n = Number(normalized);
+    if (!valid(field, n)) {
+      return sendMessage(env, chatId,
+        `❌ Некорректное значение.\n\n${customPrompt(field)}`,
+        customKeyboard(s));
+    }
+    s[field] = n;
     await deleteCalcInputState(env, chatId);
     return sendMessage(env, chatId, settingsText(s), mainKeyboard(s));
   }
