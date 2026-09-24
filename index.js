@@ -136,50 +136,83 @@ function csvEscape(v) { return `"${String(v ?? "").replace(/"/g,'""')}"`; }
 
 
 function chartConfig(title, labels, values, colorByChange = false) {
-  const config = {
-    type: "line",
-    data: {
-      labels,
-      datasets: [{
+  const baseOptions = {
+    responsive: false,
+    animation: false,
+    plugins: {
+      legend: { display: false },
+      title: { display: true, text: title, color: "#f8fafc", font: { size: 24, weight: "700" } },
+    },
+    scales: {
+      x: { ticks: { color: "#ffffff", maxTicksLimit: 9 }, grid: { color: "#263044" } },
+      y: { ticks: { color: "#ffffff" }, grid: { color: "#263044" } },
+    },
+  };
+
+  if (!colorByChange) {
+    return {
+      type: "line",
+      data: { labels, datasets: [{
         label: title,
         data: values,
         borderColor: "#22c55e",
-        backgroundColor: "rgba(34,197,94,0.08)",
+        backgroundColor: "transparent",
         borderWidth: 3,
         pointRadius: values.length > 60 ? 0 : 3,
         pointHoverRadius: 5,
-        pointBackgroundColor: colorByChange ? "__POINT_COLOR__" : "#22c55e",
-        pointBorderColor: colorByChange ? "__POINT_COLOR__" : "#22c55e",
+        pointBackgroundColor: "#22c55e",
+        pointBorderColor: "#22c55e",
         fill: false,
         tension: 0.12,
-        segment: colorByChange ? { borderColor: "__SEGMENT_COLOR__" } : undefined,
-      }],
-    },
-    options: {
-      responsive: false,
-      animation: false,
-      plugins: {
-        legend: { display: false },
-        title: { display: true, text: title, color: "#f8fafc", font: { size: 24, weight: "700" } },
-      },
-      scales: {
-        x: { ticks: { color: "#ffffff", maxTicksLimit: 9 }, grid: { color: "#263044" } },
-        y: { ticks: { color: "#ffffff", callback: "__Y_TICK__" }, grid: { color: "#263044" } },
-      },
-    },
-  };
-  return config;
+      }] },
+      options: baseOptions,
+    };
+  }
+
+  // Build one two-point dataset per trade. This avoids QuickChart/Chart.js
+  // callback serialization issues and guarantees green/red segments.
+  const datasets = [];
+  for (let i = 0; i < Math.max(0, values.length - 1); i++) {
+    const up = Number(values[i + 1]) >= Number(values[i]);
+    const color = up ? "#22c55e" : "#ef4444";
+    const segmentData = values.map(() => null);
+    segmentData[i] = values[i];
+    segmentData[i + 1] = values[i + 1];
+    datasets.push({
+      label: "",
+      data: segmentData,
+      borderColor: color,
+      backgroundColor: "transparent",
+      borderWidth: 4,
+      pointRadius: values.length > 60 ? 0 : 4,
+      pointHoverRadius: 6,
+      pointBackgroundColor: color,
+      pointBorderColor: color,
+      fill: false,
+      tension: 0.12,
+      spanGaps: false,
+    });
+  }
+  if (!datasets.length) {
+    datasets.push({
+      label: title,
+      data: values,
+      borderColor: "#22c55e",
+      backgroundColor: "transparent",
+      borderWidth: 4,
+      pointRadius: 4,
+      pointBackgroundColor: "#22c55e",
+      pointBorderColor: "#22c55e",
+      fill: false,
+      tension: 0.12,
+    });
+  }
+
+  return { type: "line", data: { labels, datasets }, options: baseOptions };
 }
 
 function chartConfigString(title, labels, values, colorByChange = false) {
-  const config = chartConfig(title, labels, values, colorByChange);
-  let json = JSON.stringify(config);
-  json = json.replace('"__Y_TICK__"', 'function(value){return "$" + Number(value).toFixed(2);}');
-  if (colorByChange) {
-    json = json.replace('"__SEGMENT_COLOR__"', 'function(ctx){var d=ctx.p1.parsed.y-ctx.p0.parsed.y;return d>=0 ? "#22c55e" : "#ef4444";}');
-    json = json.replace('"__POINT_COLOR__"', 'function(ctx){if(!ctx.dataset || !ctx.dataset.data) return "#22c55e"; var i=ctx.dataIndex; if(i<=0) return "#22c55e"; var d=ctx.dataset.data[i]-ctx.dataset.data[i-1]; return d>=0 ? "#22c55e" : "#ef4444";}');
-  }
-  return json;
+  return JSON.stringify(chartConfig(title, labels, values, colorByChange));
 }
 
 async function sendChartPhoto(env, chatId, title, subtitle, labels, values, backCallback, colorByChange = false) {
