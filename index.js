@@ -52,13 +52,38 @@ function diaryAddKeyboard() {
   ] };
 }
 
-function diaryListKeyboard(page, total) {
+function diaryListKeyboard(page, total, rows = []) {
   const pages = Math.max(1, Math.ceil(total / DIARY_PAGE_SIZE));
   const nav = [];
   if (page > 0) nav.push({ text: "⬅️ Назад", callback_data: `diary:list:${page - 1}` });
   nav.push({ text: `📄 ${page + 1}/${pages}`, callback_data: `diary:list:${page}` });
   if (page < pages - 1) nav.push({ text: "Вперёд ➡️", callback_data: `diary:list:${page + 1}` });
-  return { inline_keyboard: [nav, [{ text: "📓 Дневник", callback_data: "diary:menu" }]] };
+  const keyboard = [nav];
+  for (const x of rows) {
+    const icon = Number(x.pnl) >= 0 ? "🟢" : "🔴";
+    keyboard.push([{ text: `🗑 №${x.id} ${icon} ${x.symbol} ${x.direction}`, callback_data: `diary:delete:${x.id}:${page}` }]);
+  }
+  keyboard.push([{ text: "📓 Дневник", callback_data: "diary:menu" }]);
+  return { inline_keyboard: keyboard };
+}
+
+function diaryDeleteConfirmKeyboard(id, page = 0) {
+  return { inline_keyboard: [[
+    { text: "🗑 Да, удалить", callback_data: `diary:delconfirm:${id}:${page}` },
+    { text: "↩️ Отмена", callback_data: `diary:list:${page}` }
+  ]] };
+}
+
+function bybitStatusKeyboard(connected) {
+  const rows = [];
+  if (connected) {
+    rows.push([{ text: "🔄 Синхронизировать", callback_data: "diary:bybit:sync" }]);
+    rows.push([{ text: "⚙️ Переподключить Bybit", callback_data: "diary:bybit:connect" }, { text: "❌ Отключить", callback_data: "diary:bybit:disconnect" }]);
+  } else {
+    rows.push([{ text: "🔗 Подключить Bybit", callback_data: "diary:bybit:connect" }]);
+  }
+  rows.push([{ text: "📓 Дневник", callback_data: "diary:menu" }]);
+  return { inline_keyboard: rows };
 }
 
 async function ensureDiary(env) {
@@ -169,22 +194,97 @@ function bybitHex(buf) {
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+function b64(buf) {
+  const bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf);
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(out);
+}
+
+function fromB64(s) {
+  const bin = atob(String(s));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function deriveStorageKey(env) {
+  if (!env.BOT_TOKEN) throw new Error("BOT_TOKEN is missing");
+  const seed = new TextEncoder().encode(`risk-manager-bybit-v1:${env.BOT_TOKEN}`);
+  const digest = await crypto.subtle.digest("SHA-256", seed);
+  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function encryptSecret(env, value) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveStorageKey(env);
+  const data = new TextEncoder().encode(String(value));
+  const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
+  return { iv: b64(iv), cipher: b64(cipher) };
+}
+
+async function decryptSecret(env, iv, cipher) {
+  const key = await deriveStorageKey(env);
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: fromB64(iv) }, key, fromB64(cipher));
+  return new TextDecoder().decode(plain);
+}
+
+async function ensureBybit(env) {
+  await ensureStateTable(env);
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS bybit_sync (chat_id TEXT PRIMARY KEY, last_ms INTEGER NOT NULL DEFAULT 0, connected_at TEXT, last_error TEXT DEFAULT '')`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS bybit_imports (chat_id TEXT NOT NULL, key TEXT NOT NULL, updated_ms INTEGER NOT NULL, PRIMARY KEY(chat_id,key))`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS bybit_connections (chat_id TEXT PRIMARY KEY, api_key_iv TEXT NOT NULL, api_key_cipher TEXT NOT NULL, api_secret_iv TEXT NOT NULL, api_secret_cipher TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)`).run();
+}
+
+async function getBybitConnection(env, chatId) {
+  await ensureBybit(env);
+  const row = await env.DB.prepare("SELECT * FROM bybit_connections WHERE chat_id=? AND enabled=1")
+    .bind(String(chatId)).first().catch(() => null);
+  if (!row) return null;
+  try {
+    return {
+      apiKey: await decryptSecret(env, row.api_key_iv, row.api_key_cipher),
+      apiSecret: await decryptSecret(env, row.api_secret_iv, row.api_secret_cipher),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  } catch (e) {
+    throw new Error("Не удалось расшифровать подключение Bybit.");
+  }
+}
+
+async function saveBybitConnection(env, chatId, apiKey, apiSecret) {
+  await ensureBybit(env);
+  const key = await encryptSecret(env, apiKey);
+  const secret = await encryptSecret(env, apiSecret);
+  const now = new Date().toISOString();
+  await env.DB.prepare(`INSERT INTO bybit_connections(chat_id,api_key_iv,api_key_cipher,api_secret_iv,api_secret_cipher,created_at,updated_at,enabled) VALUES(?,?,?,?,?,?,?,1)
+    ON CONFLICT(chat_id) DO UPDATE SET api_key_iv=excluded.api_key_iv,api_key_cipher=excluded.api_key_cipher,api_secret_iv=excluded.api_secret_iv,api_secret_cipher=excluded.api_secret_cipher,updated_at=excluded.updated_at,enabled=1`)
+    .bind(String(chatId), key.iv, key.cipher, secret.iv, secret.cipher, now, now).run();
+}
+
+async function removeBybitConnection(env, chatId) {
+  await ensureBybit(env);
+  await env.DB.prepare("DELETE FROM bybit_connections WHERE chat_id=?").bind(String(chatId)).run();
+  await env.DB.prepare("DELETE FROM bybit_sync WHERE chat_id=?").bind(String(chatId)).run();
+  await env.DB.prepare("DELETE FROM bybit_imports WHERE chat_id=?").bind(String(chatId)).run();
+}
+
 async function bybitSign(secret, payload) {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return bybitHex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload)));
 }
 
-async function bybitGet(env, path, params = {}) {
-  if (!env.BYBIT_API_KEY || !env.BYBIT_API_SECRET) throw new Error("BYBIT_API_KEY/BYBIT_API_SECRET missing");
+async function bybitGetWithCreds(apiKey, apiSecret, path, params = {}) {
   const ts = Date.now().toString();
   const recvWindow = "5000";
   const qs = Object.entries(params).filter(([,v]) => v !== undefined && v !== null && v !== "").map(([k,v]) => [k, String(v)]);
   qs.sort((a,b) => a[0].localeCompare(b[0]));
   const query = new URLSearchParams(qs).toString();
-  const sign = await bybitSign(env.BYBIT_API_SECRET, ts + env.BYBIT_API_KEY + recvWindow + query);
-  const url = `https://api.bybit.com${path}?${query}`;
+  const sign = await bybitSign(apiSecret, ts + apiKey + recvWindow + query);
+  const url = `https://api.bybit.com${path}${query ? `?${query}` : ""}`;
   const r = await fetch(url, { headers: {
-    "X-BAPI-API-KEY": env.BYBIT_API_KEY,
+    "X-BAPI-API-KEY": apiKey,
     "X-BAPI-TIMESTAMP": ts,
     "X-BAPI-RECV-WINDOW": recvWindow,
     "X-BAPI-SIGN": sign,
@@ -195,22 +295,31 @@ async function bybitGet(env, path, params = {}) {
   return data.result || {};
 }
 
-async function ensureBybit(env) {
-  await ensureStateTable(env);
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS bybit_sync (chat_id TEXT PRIMARY KEY, last_ms INTEGER NOT NULL DEFAULT 0, connected_at TEXT, last_error TEXT DEFAULT '')`).run();
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS bybit_imports (chat_id TEXT NOT NULL, key TEXT NOT NULL, updated_ms INTEGER NOT NULL, PRIMARY KEY(chat_id,key))`).run();
+async function bybitGet(env, chatId, path, params = {}) {
+  const conn = await getBybitConnection(env, chatId);
+  if (!conn) throw new Error("Bybit не подключён для этого пользователя.");
+  return bybitGetWithCreds(conn.apiKey, conn.apiSecret, path, params);
+}
+
+async function validateBybitCredentials(apiKey, apiSecret) {
+  const result = await bybitGetWithCreds(apiKey, apiSecret, "/v5/user/query-api", {});
+  if (Number(result.readOnly) !== 1) throw new Error("API-ключ должен быть Read Only.");
+  const contract = result.permissions?.ContractTrade || [];
+  if (!contract.includes("Order") || !contract.includes("Position")) {
+    throw new Error("Для дневника нужны права только на чтение Orders и Positions для контрактов.");
+  }
+  return result;
 }
 
 async function bybitStatus(env, chatId) {
-  if (!env.BYBIT_API_KEY || !env.BYBIT_API_SECRET) return { connected:false, error:"В Cloudflare не заданы BYBIT_API_KEY и BYBIT_API_SECRET." };
+  const conn = await getBybitConnection(env, chatId);
   await ensureBybit(env);
   const row = await env.DB.prepare("SELECT last_ms,last_error,connected_at FROM bybit_sync WHERE chat_id=?").bind(String(chatId)).first().catch(()=>null);
-  return { connected:true, lastMs:Number(row?.last_ms||0), error:row?.last_error||"", connectedAt:row?.connected_at||"" };
+  return { connected: !!conn, lastMs:Number(row?.last_ms||0), error:row?.last_error||"", connectedAt:row?.connected_at||"" };
 }
 
-
 async function syncBybitOpenPositions(env, chatId) {
-  const result = await bybitGet(env, "/v5/position/list", { category:"linear", settleCoin:"USDT", limit:200 });
+  const result = await bybitGet(env, chatId, "/v5/position/list", { category:"linear", settleCoin:"USDT", limit:200 });
   const list = Array.isArray(result.list) ? result.list : [];
   let opened = 0;
   for (const x of list) {
@@ -237,17 +346,16 @@ async function syncBybitOpenPositions(env, chatId) {
 }
 
 async function importBybitClosed(env, chatId) {
-  if (!env.BYBIT_API_KEY || !env.BYBIT_API_SECRET) return { imported:0 };
   await ensureDiary(env); await ensureBybit(env);
   const state = await env.DB.prepare("SELECT last_ms FROM bybit_sync WHERE chat_id=?").bind(String(chatId)).first().catch(()=>null);
   const start = Math.max(0, Number(state?.last_ms || 0) - 120000);
-  const result = await bybitGet(env, "/v5/position/closed-pnl", { category:"linear", limit:100, ...(start ? {startTime:start} : {}) });
+  const result = await bybitGet(env, chatId, "/v5/position/closed-pnl", { category:"linear", limit:100, ...(start ? {startTime:start} : {}) });
   const list = Array.isArray(result.list) ? result.list : [];
   let maxMs = Number(state?.last_ms || 0), imported = 0;
   for (const x of list.reverse()) {
     const updated = Number(x.updatedTime || x.createdTime || 0);
     maxMs = Math.max(maxMs, updated);
-    if (!x.orderId || String(x.execType || "Trade") !== "Trade") continue;
+    if (!x.orderId) continue;
     const key = `${x.orderId}:${updated}:${x.closedSize || x.qty || ""}`;
     const exists = await env.DB.prepare("SELECT 1 FROM bybit_imports WHERE chat_id=? AND key=?").bind(String(chatId), key).first().catch(()=>null);
     if (exists) continue;
@@ -272,13 +380,14 @@ async function importBybitClosed(env, chatId) {
     await env.DB.prepare("INSERT INTO bybit_imports(chat_id,key,updated_ms) VALUES(?,?,?)").bind(String(chatId), key, updated).run();
     imported++;
   }
-  await env.DB.prepare(`INSERT INTO bybit_sync(chat_id,last_ms,connected_at,last_error) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET last_ms=excluded.last_ms,last_error=''`)
+  await env.DB.prepare(`INSERT INTO bybit_sync(chat_id,last_ms,connected_at,last_error) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET last_ms=excluded.last_ms,connected_at=excluded.connected_at,last_error=''`)
     .bind(String(chatId), maxMs, new Date().toISOString(), "").run();
   return { imported, maxMs };
 }
 
 async function syncBybit(env, chatId, notify = true) {
   try {
+    if (!(await getBybitConnection(env, chatId))) return { imported:0, opened:0 };
     const open = await syncBybitOpenPositions(env, chatId);
     const r = await importBybitClosed(env, chatId);
     if (notify && (r.imported > 0 || open.opened > 0)) await sendMessage(env, chatId, `🔗 <b>Bybit синхронизация</b>\n\nОткрыто новых позиций: <b>${open.opened}</b>\nЗакрыто/импортировано сделок: <b>${r.imported}</b>.\nP/L и комиссии берутся из данных Bybit.`, diaryKeyboard());
@@ -294,15 +403,23 @@ async function syncBybit(env, chatId, notify = true) {
 async function getBybitChatIds(env) {
   if (!env.DB) return [];
   await ensureBybit(env);
-  const r = await env.DB.prepare("SELECT chat_id FROM bybit_sync ORDER BY chat_id").all().catch(()=>({results:[]}));
+  const r = await env.DB.prepare("SELECT chat_id FROM bybit_connections WHERE enabled=1 ORDER BY chat_id").all().catch(()=>({results:[]}));
   return (r.results || []).map(x => String(x.chat_id));
 }
 
 async function diaryTrades(env, chatId, limit=DIARY_PAGE_SIZE, offset=0) {
   await ensureDiary(env);
-  const r = await env.DB.prepare("SELECT id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin FROM trades WHERE chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?").bind(String(chatId), limit, offset).all();
+  const r = await env.DB.prepare("SELECT id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin,source,status FROM trades WHERE chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?").bind(String(chatId), limit, offset).all();
   const c = await env.DB.prepare("SELECT COUNT(*) AS n FROM trades WHERE chat_id=?").bind(String(chatId)).first();
   return { rows:r.results||[], total:Number(c?.n||0) };
+}
+
+async function deleteDiaryTrade(env, chatId, id) {
+  await ensureDiary(env);
+  const row = await env.DB.prepare("SELECT id,symbol,direction,source,status FROM trades WHERE id=? AND chat_id=?").bind(Number(id), String(chatId)).first().catch(()=>null);
+  if (!row) return { ok:false };
+  await env.DB.prepare("DELETE FROM trades WHERE id=? AND chat_id=?").bind(Number(id), String(chatId)).run();
+  return { ok:true, row };
 }
 
 async function diaryStats(env, chatId) {
@@ -458,7 +575,7 @@ async function diaryTextMenu(env, chatId) {
 
 function diaryRowsText(rows, page, total) {
   if (!rows.length) return "<b>📖 Мои сделки</b>\n\nПока сделок нет. Нажми «➕ Добавить сделку».";
-  const lines=[`<b>📖 Мои сделки</b>\nСтраница ${page+1}\n`];
+  const lines=[`<b>📖 Мои сделки</b>\nСтраница ${page+1}\n<i>Нажми 🗑 под сделкой, чтобы удалить её.</i>\n`];
   for (const x of rows) {
     const icon=Number(x.pnl)>=0?"🟢":"🔴";
     lines.push(`<b>№${x.id} ${icon} ${x.symbol} ${x.direction}</b>`,`${new Date(x.created_at).toLocaleString('ru-RU')}`,`Объём: ${x.volume!=null?money(x.volume):"—"}`,`Вход: ${x.entry} → выход: ${x.exit}`,`Плечо: ${x.leverage??"—"}x | Стоп: ${x.stop_pct!=null?x.stop_pct+"%":"—"}`,`Комиссия Bybit: ${money(x.fee)}`,`P/L: <b>${Number(x.pnl)>=0?"+":""}${money(x.pnl)}</b>`,x.comment?`📝 ${x.comment}`:"","");
@@ -986,14 +1103,28 @@ async function handleCallback(env, query) {
   if (data === "diary:bybit") {
     const st = await bybitStatus(env, chatId);
     if (!st.connected) {
-      return editMessage(env, chatId, messageId, "<b>🔗 Подключение Bybit</b>\n\nAPI пока не настроен. Сначала добавь в Cloudflare Worker Secrets:\n<code>BYBIT_API_KEY</code>\n<code>BYBIT_API_SECRET</code>\n\n🔒 Ключ должен быть только <b>Read Only</b>, без прав на торговлю и вывод средств.\n\nПосле добавления нажми «🔗 Bybit» ещё раз.", diaryKeyboard());
+      return editMessage(env, chatId, messageId, "<b>🔗 Bybit</b>\n\nПодключи свой аккаунт Bybit через защищённую страницу.\n\nДанные каждого пользователя хранятся отдельно и не смешиваются с чужими дневниками. Нужен только Read Only доступ.", bybitStatusKeyboard(false));
     }
+    return editMessage(env, chatId, messageId, `<b>🔗 Bybit подключён</b>\n\nСтатус: 🟢 подключён\n${st.last_error ? `Последняя ошибка: <code>${String(st.last_error).slice(0,300)}</code>\n` : ""}\nМожно запустить синхронизацию вручную или дождаться автоматической проверки.`, bybitStatusKeyboard(true));
+  }
+
+  if (data === "diary:bybit:connect") {
+    const base = "https://risk-manager-telegram.danzeldan.workers.dev";
+    return editMessage(env, chatId, messageId, "<b>🔗 Подключение Bybit</b>\n\nОткрой защищённую страницу кнопкой ниже.\n\nВведи API Key и API Secret своего аккаунта. Бот принимает только Read Only подключение и не получает права на торговлю или вывод средств.\n\nПодключение привязано к твоему Telegram-аккаунту.", { inline_keyboard: [[{ text: "🔗 Подключить Bybit", web_app: { url: `${base}/bybit/connect` } }], [{ text: "⬅️ Назад", callback_data: "diary:bybit" }]] });
+  }
+
+  if (data === "diary:bybit:sync") {
     try {
       const r = await syncBybit(env, chatId, false);
-      return editMessage(env, chatId, messageId, `<b>🔗 Bybit подключён</b>\n\nСтатус: 🟢 работает\nНовых сделок при проверке: <b>${r.imported}</b>\n\nБот автоматически проверяет закрытые сделки Bybit и добавляет их в дневник.`, diaryKeyboard());
+      return editMessage(env, chatId, messageId, `<b>🔗 Bybit синхронизация</b>\n\n🟢 Готово.\nНовых закрытых сделок: <b>${r.imported}</b>\nНовых открытых позиций: <b>${r.opened}</b>`, bybitStatusKeyboard(true));
     } catch (e) {
-      return editMessage(env, chatId, messageId, `<b>🔗 Bybit</b>\n\n🔴 Ошибка подключения:\n<code>${String(e.message || e).slice(0,400)}</code>\n\nПроверь API key/secret и права Read Only.`, diaryKeyboard());
+      return editMessage(env, chatId, messageId, `<b>🔗 Bybit</b>\n\n🔴 Синхронизация не выполнена.\n<code>${String(e.message || e).slice(0,400)}</code>`, bybitStatusKeyboard(true));
     }
+  }
+
+  if (data === "diary:bybit:disconnect") {
+    await removeBybitConnection(env, chatId);
+    return editMessage(env, chatId, messageId, "<b>🔗 Bybit отключён</b>\n\nПодключение этого пользователя удалено. Дневник и уже записанные сделки сохранены.", bybitStatusKeyboard(false));
   }
 
   if (data === "diary:add") {
@@ -1020,7 +1151,31 @@ async function handleCallback(env, query) {
   if (data.startsWith("diary:list:")) {
     const page=Math.max(0,Number(data.split(":")[2])||0);
     const result=await diaryTrades(env,chatId,DIARY_PAGE_SIZE,page*DIARY_PAGE_SIZE);
-    return editMessage(env,chatId,messageId,diaryRowsText(result.rows,page,result.total),diaryListKeyboard(page,result.total));
+    return editMessage(env,chatId,messageId,diaryRowsText(result.rows,page,result.total),diaryListKeyboard(page,result.total,result.rows));
+  }
+
+  if (data.startsWith("diary:delete:")) {
+    const parts=data.split(":");
+    const id=Number(parts[2]);
+    const page=Math.max(0,Number(parts[3])||0);
+    const row=await env.DB.prepare("SELECT id,symbol,direction,pnl,source,status FROM trades WHERE id=? AND chat_id=?").bind(id,String(chatId)).first().catch(()=>null);
+    if (!row) return tg(env,"answerCallbackQuery",{callback_query_id:query.id,text:"Сделка уже удалена или не найдена.",show_alert:true});
+    const icon=Number(row.pnl)>=0?"🟢":"🔴";
+    const sourceText=row.source==="bybit"?"Bybit":"вручную";
+    return editMessage(env,chatId,messageId,`<b>🗑 Удалить сделку №${row.id}?</b>\n\n${icon} ${row.symbol} ${row.direction}\nP/L: <b>${Number(row.pnl)>=0?"+":""}${money(row.pnl)}</b>\nИсточник: ${sourceText}\n\nПосле удаления она исчезнет из статистики и графиков.`,diaryDeleteConfirmKeyboard(id,page));
+  }
+
+  if (data.startsWith("diary:delconfirm:")) {
+    const parts=data.split(":");
+    const id=Number(parts[2]);
+    const page=Math.max(0,Number(parts[3])||0);
+    const result=await deleteDiaryTrade(env,chatId,id);
+    if (!result.ok) return tg(env,"answerCallbackQuery",{callback_query_id:query.id,text:"Сделка уже удалена или не найдена.",show_alert:true});
+    const totalAfter=(await diaryTrades(env,chatId,1,0)).total;
+    const safePage=totalAfter>0?Math.min(page,Math.max(0,Math.ceil(totalAfter/DIARY_PAGE_SIZE)-1)):0;
+    const pageRows=await diaryTrades(env,chatId,DIARY_PAGE_SIZE,safePage*DIARY_PAGE_SIZE);
+    await tg(env,"answerCallbackQuery",{callback_query_id:query.id,text:"Сделка удалена"});
+    return editMessage(env,chatId,messageId,diaryRowsText(pageRows.rows,safePage,pageRows.total),diaryListKeyboard(safePage,pageRows.total,pageRows.rows));
   }
 
   if (data === "diary:stats") {
@@ -1286,6 +1441,61 @@ async function handleMessage(env, message) {
   );
 }
 
+function htmlEscape(v) {
+  return String(v ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+function bybitConnectPage(message, status = 200) {
+  return new Response(`<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Подключение</title><style>body{font-family:Arial,sans-serif;background:#0b0d12;color:#f5f7fa;margin:0;padding:24px}main{max-width:520px;margin:30px auto;background:#151922;border-radius:18px;padding:24px}h1{font-size:24px}p{line-height:1.5;color:#c5cad3}label{display:block;margin:18px 0 8px}input{width:100%;box-sizing:border-box;padding:14px;border-radius:10px;border:1px solid #303746;background:#0d1016;color:#fff;font-size:16px}button{width:100%;margin-top:22px;padding:14px;border:0;border-radius:10px;background:#f6a623;color:#111;font-weight:700;font-size:16px}.note{font-size:13px;color:#9da5b2}.ok{color:#55d187}.err{color:#ff7272}</style></head><body><main><h1>🔗 Подключение</h1>${message}</main></body></html>`, { status, headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'" } });
+}
+
+async function validateTelegramWebAppInitData(env, initData) {
+  const raw = String(initData || "");
+  if (!raw) throw new Error("Открой подключение из Telegram.");
+  const params = new URLSearchParams(raw);
+  const receivedHash = params.get("hash");
+  const authDate = Number(params.get("auth_date") || 0);
+  if (!receivedHash || !authDate) throw new Error("Некорректные данные Telegram.");
+  if (Math.abs(Date.now() / 1000 - authDate) > 24 * 60 * 60) throw new Error("Сессия Telegram устарела. Закрой страницу и открой подключение заново.");
+  const pairs = [];
+  for (const [key, value] of params.entries()) if (key !== "hash") pairs.push([key, value]);
+  pairs.sort((a,b) => a[0].localeCompare(b[0]));
+  const dataCheckString = pairs.map(([k,v]) => `${k}=${v}`).join("\n");
+  const secretKey = await crypto.subtle.importKey("raw", new TextEncoder().encode("WebAppData"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const secret = await crypto.subtle.sign("HMAC", secretKey, new TextEncoder().encode(env.BOT_TOKEN));
+  const dataKey = await crypto.subtle.importKey("raw", secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const calculated = bybitHex(await crypto.subtle.sign("HMAC", dataKey, new TextEncoder().encode(dataCheckString)));
+  if (calculated !== receivedHash) throw new Error("Не удалось подтвердить Telegram-сессию.");
+  let user = null;
+  try { user = JSON.parse(params.get("user") || "null"); } catch {}
+  if (!user?.id) throw new Error("Telegram-пользователь не найден.");
+  return String(user.id);
+}
+
+function bybitConnectPage(message, status = 200) {
+  return new Response(`<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>Подключение</title><style>body{font-family:Arial,sans-serif;background:#0b0d12;color:#f5f7fa;margin:0;padding:24px}main{max-width:520px;margin:30px auto;background:#151922;border-radius:18px;padding:24px}h1{font-size:24px}p{line-height:1.5;color:#c5cad3}label{display:block;margin:18px 0 8px}input{width:100%;box-sizing:border-box;padding:14px;border-radius:10px;border:1px solid #303746;background:#0d1016;color:#fff;font-size:16px}button{width:100%;margin-top:22px;padding:14px;border:0;border-radius:10px;background:#f6a623;color:#111;font-weight:700;font-size:16px}.note{font-size:13px;color:#9da5b2}.ok{color:#55d187}.err{color:#ff7272}</style></head><body><main><h1>🔗 Подключение</h1>${message}</main></body></html>`, { status, headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; script-src https://telegram.org; style-src 'unsafe-inline'" } });
+}
+
+async function handleBybitConnectPage(env, request) {
+  if (request.method === "GET") {
+    return bybitConnectPage(`<p>Подключи свой аккаунт через Telegram.</p><form id="f" method="post"><input type="hidden" id="initData" name="initData"><label>API Key</label><input name="apiKey" autocomplete="off" required><label>API Secret</label><input name="apiSecret" type="password" autocomplete="off" required><p class="note">Нужен только Read Only ключ с доступом к контрактным ордерам и позициям. Данные не отправляются в Telegram-сообщения.</p><button type="submit">Подключить</button></form><script src="https://telegram.org/js/telegram-web-app.js"></script><script>(function(){if(!window.Telegram||!Telegram.WebApp){document.body.innerHTML='<main><h1>🔗 Подключение</h1><p class="err">Открой эту страницу кнопкой из Telegram.</p></main>';return}Telegram.WebApp.ready();document.getElementById('initData').value=Telegram.WebApp.initData;})();</script>`);
+  }
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const form = await request.formData();
+  const apiKey = String(form.get("apiKey") || "").trim();
+  const apiSecret = String(form.get("apiSecret") || "").trim();
+  try {
+    const chatId = await validateTelegramWebAppInitData(env, String(form.get("initData") || ""));
+    if (!apiKey || !apiSecret) throw new Error("Заполни оба поля.");
+    await validateBybitCredentials(apiKey, apiSecret);
+    await saveBybitConnection(env, chatId, apiKey, apiSecret);
+    await sendMessage(env, chatId, "<b>🔗 Bybit подключён</b>\n\n🟢 Подключение проверено. Теперь сделки этого аккаунта будут синхронизироваться только с твоим дневником.", bybitStatusKeyboard(true));
+    return bybitConnectPage('<p class="ok"><b>Подключение выполнено.</b></p><p>Вернись в Telegram. Твой дневник уже готов к синхронизации.</p>');
+  } catch (e) {
+    return bybitConnectPage(`<p class="err"><b>Не удалось подключить.</b></p><p>${htmlEscape(String(e.message || e))}</p><p>Проверь данные и открой подключение заново из Telegram.</p>`, 400);
+  }
+}
+
 async function setWebhook(env, request) {
   const url = new URL(request.url);
   url.pathname = "/";
@@ -1334,6 +1544,12 @@ export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
+
+      if (request.method === "GET" || request.method === "POST") {
+        if (url.pathname === "/bybit/connect") {
+          return await handleBybitConnectPage(env, request);
+        }
+      }
 
       if (request.method === "GET") {
         if (url.pathname === "/set-webhook") {
