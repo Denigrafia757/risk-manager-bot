@@ -1445,10 +1445,6 @@ function htmlEscape(v) {
   return String(v ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
 
-function bybitConnectPage(message, status = 200) {
-  return new Response(`<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Подключение</title><style>body{font-family:Arial,sans-serif;background:#0b0d12;color:#f5f7fa;margin:0;padding:24px}main{max-width:520px;margin:30px auto;background:#151922;border-radius:18px;padding:24px}h1{font-size:24px}p{line-height:1.5;color:#c5cad3}label{display:block;margin:18px 0 8px}input{width:100%;box-sizing:border-box;padding:14px;border-radius:10px;border:1px solid #303746;background:#0d1016;color:#fff;font-size:16px}button{width:100%;margin-top:22px;padding:14px;border:0;border-radius:10px;background:#f6a623;color:#111;font-weight:700;font-size:16px}.note{font-size:13px;color:#9da5b2}.ok{color:#55d187}.err{color:#ff7272}</style></head><body><main><h1>🔗 Подключение</h1>${message}</main></body></html>`, { status, headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'" } });
-}
-
 async function validateTelegramWebAppInitData(env, initData) {
   const raw = String(initData || "");
   if (!raw) throw new Error("Открой подключение из Telegram.");
