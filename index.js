@@ -135,7 +135,10 @@ async function diaryStats(env, chatId) {
 function csvEscape(v) { return `"${String(v ?? "").replace(/"/g,'""')}"`; }
 
 
-function chartConfig(title, labels, values, colorByChange = false) {
+function chartConfig(title, labels, values, colorByChange = false, tradePnl = []) {
+  const pnl = Array.isArray(tradePnl) ? tradePnl.map(Number) : [];
+  const hasPnl = pnl.length === Math.max(0, values.length - 1);
+  const chartLabels = hasPnl ? labels.map((label, i) => i === 0 ? label : `${label} ${pnl[i-1] >= 0 ? "+" : "-"}$${Math.abs(pnl[i-1]).toFixed(2)}`) : labels;
   const baseOptions = {
     responsive: false,
     animation: false,
@@ -144,88 +147,59 @@ function chartConfig(title, labels, values, colorByChange = false) {
       title: { display: true, text: title, color: "#f8fafc", font: { size: 24, weight: "700" } },
     },
     scales: {
-      x: { ticks: { color: "#ffffff", maxTicksLimit: 9 }, grid: { color: "#263044" } },
-      y: { ticks: { color: "#ffffff" }, grid: { color: "#263044" } },
+      x: { ticks: { color: "#ffffff", maxTicksLimit: 14, font: { size: 14, weight: "600" } }, grid: { color: "#263044" } },
+      y: { position: "left", ticks: { color: "#ffffff", font: { size: 14, weight: "600" }, callback: (v) => "$" + Number(v).toFixed(0) }, grid: { color: "#263044" }, title: { display: true, text: "Баланс", color: "#ffffff" } },
+      ...(hasPnl ? { y1: { position: "right", grid: { drawOnChartArea: false }, ticks: { color: "#ffffff", font: { size: 14, weight: "600" }, callback: (v) => (v >= 0 ? "+$" : "-$") + Math.abs(Number(v)).toFixed(0) }, title: { display: true, text: "P/L сделки", color: "#ffffff" } } } : {}),
     },
   };
 
-  if (!colorByChange) {
-    return {
-      type: "line",
-      data: { labels, datasets: [{
-        label: title,
-        data: values,
-        borderColor: "#22c55e",
-        backgroundColor: "transparent",
-        borderWidth: 3,
-        pointRadius: values.length > 60 ? 0 : 3,
-        pointHoverRadius: 5,
-        pointBackgroundColor: "#22c55e",
-        pointBorderColor: "#22c55e",
-        fill: false,
-        tension: 0.12,
-      }] },
-      options: baseOptions,
-    };
-  }
-
-  // Build one two-point dataset per trade. This avoids QuickChart/Chart.js
-  // callback serialization issues and guarantees green/red segments.
   const datasets = [];
-  for (let i = 0; i < Math.max(0, values.length - 1); i++) {
-    const up = Number(values[i + 1]) >= Number(values[i]);
-    const color = up ? "#22c55e" : "#ef4444";
-    const segmentData = values.map(() => null);
-    segmentData[i] = values[i];
-    segmentData[i + 1] = values[i + 1];
+  if (!colorByChange) {
     datasets.push({
-      label: "",
-      data: segmentData,
-      borderColor: color,
-      backgroundColor: "transparent",
-      borderWidth: 4,
-      pointRadius: values.length > 60 ? 0 : 4,
-      pointHoverRadius: 6,
-      pointBackgroundColor: color,
-      pointBorderColor: color,
-      fill: false,
-      tension: 0.12,
-      spanGaps: false,
+      type: "line", label: title, data: values, yAxisID: "y",
+      borderColor: "#22c55e", backgroundColor: "transparent", borderWidth: 4,
+      pointRadius: values.length > 60 ? 0 : 4, pointHoverRadius: 6,
+      pointBackgroundColor: "#22c55e", pointBorderColor: "#22c55e", fill: false, tension: 0.12,
     });
+  } else {
+    for (let i = 0; i < Math.max(0, values.length - 1); i++) {
+      const up = Number(values[i + 1]) >= Number(values[i]);
+      const color = up ? "#22c55e" : "#ef4444";
+      const segmentData = values.map(() => null);
+      segmentData[i] = values[i]; segmentData[i + 1] = values[i + 1];
+      datasets.push({ type: "line", label: "", data: segmentData, yAxisID: "y", borderColor: color, backgroundColor: "transparent", borderWidth: 4, pointRadius: values.length > 60 ? 0 : 4, pointHoverRadius: 6, pointBackgroundColor: color, pointBorderColor: color, fill: false, tension: 0.12, spanGaps: false });
+    }
+    if (!datasets.length) datasets.push({ type: "line", label: title, data: values, yAxisID: "y", borderColor: "#22c55e", borderWidth: 4, pointRadius: 4, pointBackgroundColor: "#22c55e", pointBorderColor: "#22c55e", fill: false, tension: 0.12 });
   }
-  if (!datasets.length) {
+
+  if (hasPnl) {
+    const barData = [null, ...pnl];
+    const barColors = ["transparent", ...pnl.map(v => Number(v) >= 0 ? "rgba(34,197,94,0.78)" : "rgba(239,68,68,0.78)")];
     datasets.push({
-      label: title,
-      data: values,
-      borderColor: "#22c55e",
-      backgroundColor: "transparent",
-      borderWidth: 4,
-      pointRadius: 4,
-      pointBackgroundColor: "#22c55e",
-      pointBorderColor: "#22c55e",
-      fill: false,
-      tension: 0.12,
+      type: "bar", label: "P/L сделки", data: barData, yAxisID: "y1",
+      backgroundColor: barColors, borderColor: barColors, borderWidth: 1, borderRadius: 4,
+      barPercentage: 0.72, categoryPercentage: 0.82,
     });
   }
 
-  return { type: "line", data: { labels, datasets }, options: baseOptions };
+  return { type: "bar", data: { labels: chartLabels, datasets }, options: baseOptions };
 }
 
-function chartConfigString(title, labels, values, colorByChange = false) {
-  return JSON.stringify(chartConfig(title, labels, values, colorByChange));
+function chartConfigString(title, labels, values, colorByChange = false, tradePnl = []) {
+  return JSON.stringify(chartConfig(title, labels, values, colorByChange, tradePnl));
 }
 
-async function sendChartPhoto(env, chatId, title, subtitle, labels, values, backCallback, colorByChange = false) {
+async function sendChartPhoto(env, chatId, title, subtitle, labels, values, backCallback, colorByChange = false, tradePnl = []) {
   const response = await fetch("https://quickchart.io/chart", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       width: 1100,
-      height: 620,
+      height: 900,
       format: "png",
       version: "4",
       backgroundColor: "#0b0f17",
-      chart: chartConfigString(title, labels, values, colorByChange),
+      chart: chartConfigString(title, labels, values, colorByChange, tradePnl),
     }),
   });
 
@@ -249,11 +223,11 @@ async function personalChartData(env, chatId) {
   let bal=0;
   const balance=[0], pnl=[0], labels=["Старт"];
   for(const x of (r.results||[])){ bal += Number(x.pnl)||0; balance.push(bal); pnl.push(Number(x.pnl)||0); labels.push(`#${x.id}`); }
-  return {balance,pnl,labels,count:(r.results||[]).length};
+  return {balance,pnl,labels,tradePnl:(r.results||[]).map(x=>Number(x.pnl)||0),count:(r.results||[]).length};
 }
 
 function calcChartData(s) {
-  const c=calculate(s); return {values:[Number(s.deposit),...c.rows.map(r=>Number(r.after))], labels:["Старт",...c.rows.map(r=>`#${r.n}`)]};
+  const c=calculate(s); return {values:[Number(s.deposit),...c.rows.map(r=>Number(r.after))], labels:["Старт",...c.rows.map(r=>`#${r.n}`)], tradePnl:c.rows.map(r=>Number(r.net)||0)};
 }
 
 async function diaryCsv(env, chatId) {
@@ -733,6 +707,12 @@ async function handleCallback(env, query) {
   }
 
   if (data === "diary:menu") {
+    // The chart is sent as a photo, so Telegram cannot edit it with editMessageText.
+    // Remove the chart message and return to the diary menu as a normal text message.
+    if (query.message.photo) {
+      await tg(env, "deleteMessage", { chat_id: chatId, message_id: messageId }).catch(() => {});
+      return sendMessage(env, chatId, diaryTextMenu(), diaryKeyboard());
+    }
     return editMessage(env, chatId, messageId, diaryTextMenu(), diaryKeyboard());
   }
 
@@ -773,7 +753,7 @@ async function handleCallback(env, query) {
     const d=await personalChartData(env,chatId);
     if(!d.count) return editMessage(env,chatId,messageId,"<b>📈 График депозита</b>\n\nСначала добавь хотя бы одну сделку.",diaryKeyboard());
     try {
-      await sendChartPhoto(env, chatId, "График баланса", "🟢 прибыльная сделка · 🔴 убыточная сделка", d.labels, d.balance, "diary:menu", true);
+      await sendChartPhoto(env, chatId, "График баланса", "🟢 прибыльная · 🔴 убыточная · столбики показывают P/L каждой сделки", d.labels, d.balance, "diary:menu", true, d.tradePnl);
     } catch (e) {
       console.error("DIARY_BALANCE_CHART", e);
       await sendMessage(env, chatId, "❌ Не удалось построить график. Нажми кнопку ещё раз.", diaryKeyboard());
@@ -785,7 +765,7 @@ async function handleCallback(env, query) {
     const d=await personalChartData(env,chatId);
     if(!d.count) return editMessage(env,chatId,messageId,"<b>📊 График P/L</b>\n\nСначала добавь хотя бы одну сделку.",diaryKeyboard());
     try {
-      await sendChartPhoto(env, chatId, "Кривая P/L", "Фактические сделки · накопительный P/L", d.labels, d.pnl, "diary:menu");
+      await sendChartPhoto(env, chatId, "Кривая P/L", "Фактические сделки · накопительный P/L", d.labels, d.pnl, "diary:menu", false, d.tradePnl);
     } catch (e) {
       console.error("DIARY_PNL_CHART", e);
       await sendMessage(env, chatId, "❌ Не удалось построить график. Нажми кнопку ещё раз.", diaryKeyboard());
@@ -915,7 +895,7 @@ async function handleCallback(env, query) {
     const s=unpackState(data.slice("calcchart:".length));
     const d=calcChartData(s);
     try {
-      await sendChartPhoto(env, chatId, "График расчётного депозита", "🟢 прибыльная сделка · 🔴 убыточная сделка", d.labels, d.values, `trades:0:${packState(s)}`, true);
+      await sendChartPhoto(env, chatId, "График расчётного депозита", "🟢 прибыльная · 🔴 убыточная · столбики показывают P/L каждой сделки", d.labels, d.values, `trades:0:${packState(s)}`, true, d.tradePnl);
     } catch (e) {
       console.error("CALC_CHART", e);
       await sendMessage(env, chatId, "❌ Не удалось построить график. Нажми кнопку ещё раз.", tradesKeyboard(s, 0, calculate(s).rows.length));
