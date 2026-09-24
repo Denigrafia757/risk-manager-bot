@@ -91,6 +91,28 @@ async function deleteDiaryState(env, chatId) {
   await env.DB.prepare("DELETE FROM bot_state WHERE chat_id=? AND state_key=?").bind(String(chatId), `diary_state:${chatId}`).run();
 }
 
+async function getCalcInputState(env, chatId) {
+  if (!env.DB) return null;
+  await ensureStateTable(env);
+  const key = `calc_input:${chatId}`;
+  const row = await env.DB.prepare("SELECT value FROM bot_state WHERE chat_id=? AND state_key=?").bind(String(chatId), key).first().catch(()=>null);
+  if (!row) return null;
+  try { return JSON.parse(row.value); } catch { return null; }
+}
+
+async function saveCalcInputState(env, chatId, state) {
+  if (!env.DB) return;
+  await ensureStateTable(env);
+  const key = `calc_input:${chatId}`;
+  await env.DB.prepare("INSERT INTO bot_state(chat_id,state_key,value) VALUES(?,?,?) ON CONFLICT(chat_id,state_key) DO UPDATE SET value=excluded.value").bind(String(chatId), key, JSON.stringify(state)).run();
+}
+
+async function deleteCalcInputState(env, chatId) {
+  if (!env.DB) return;
+  await ensureStateTable(env);
+  await env.DB.prepare("DELETE FROM bot_state WHERE chat_id=? AND state_key=?").bind(String(chatId), `calc_input:${chatId}`).run();
+}
+
 async function addDiaryTrade(env, chatId, state) {
   await ensureDiary(env);
   await env.DB.prepare("INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment) VALUES(?,?,?,?,?,?,?,?,?,?)")
@@ -113,8 +135,8 @@ async function diaryStats(env, chatId) {
 function csvEscape(v) { return `"${String(v ?? "").replace(/"/g,'""')}"`; }
 
 
-function chartConfig(title, labels, values) {
-  return {
+function chartConfig(title, labels, values, colorByChange = false) {
+  const config = {
     type: "line",
     data: {
       labels,
@@ -122,12 +144,15 @@ function chartConfig(title, labels, values) {
         label: title,
         data: values,
         borderColor: "#22c55e",
-        backgroundColor: "rgba(34,197,94,0.10)",
+        backgroundColor: "rgba(34,197,94,0.08)",
         borderWidth: 3,
         pointRadius: values.length > 60 ? 0 : 3,
         pointHoverRadius: 5,
-        fill: true,
-        tension: 0.18,
+        pointBackgroundColor: colorByChange ? "__POINT_COLOR__" : "#22c55e",
+        pointBorderColor: colorByChange ? "__POINT_COLOR__" : "#22c55e",
+        fill: false,
+        tension: 0.12,
+        segment: colorByChange ? { borderColor: "__SEGMENT_COLOR__" } : undefined,
       }],
     },
     options: {
@@ -135,31 +160,29 @@ function chartConfig(title, labels, values) {
       animation: false,
       plugins: {
         legend: { display: false },
-        title: {
-          display: true,
-          text: title,
-          color: "#f8fafc",
-          font: { size: 24, weight: "700" },
-        },
+        title: { display: true, text: title, color: "#f8fafc", font: { size: 24, weight: "700" } },
       },
       scales: {
-        x: {
-          ticks: { color: "#94a3b8", maxTicksLimit: 9 },
-          grid: { color: "#263044" },
-        },
-        y: {
-          ticks: {
-            color: "#94a3b8",
-            callback: (value) => "$" + Number(value).toFixed(2),
-          },
-          grid: { color: "#263044" },
-        },
+        x: { ticks: { color: "#ffffff", maxTicksLimit: 9, font: { size: 14, weight: "600" } }, grid: { color: "#263044" } },
+        y: { ticks: { color: "#ffffff", callback: "__Y_TICK__", font: { size: 14, weight: "600" } }, grid: { color: "#263044" } },
       },
     },
   };
+  return config;
 }
 
-async function sendChartPhoto(env, chatId, title, subtitle, labels, values, backCallback) {
+function chartConfigString(title, labels, values, colorByChange = false) {
+  const config = chartConfig(title, labels, values, colorByChange);
+  let json = JSON.stringify(config);
+  json = json.replace('"__Y_TICK__"', 'function(value){return "$" + Number(value).toFixed(2);}');
+  if (colorByChange) {
+    json = json.replace('"__SEGMENT_COLOR__"', 'function(ctx){var d=ctx.p1.parsed.y-ctx.p0.parsed.y;return d>=0 ? "#22c55e" : "#ef4444";}');
+    json = json.replace('"__POINT_COLOR__"', 'function(ctx){if(!ctx.dataset || !ctx.dataset.data) return "#22c55e"; var i=ctx.dataIndex; if(i<=0) return "#22c55e"; var d=ctx.dataset.data[i]-ctx.dataset.data[i-1]; return d>=0 ? "#22c55e" : "#ef4444";}');
+  }
+  return json;
+}
+
+async function sendChartPhoto(env, chatId, title, subtitle, labels, values, backCallback, colorByChange = false) {
   const response = await fetch("https://quickchart.io/chart", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -167,36 +190,24 @@ async function sendChartPhoto(env, chatId, title, subtitle, labels, values, back
       width: 1100,
       height: 620,
       format: "png",
+      version: "4",
       backgroundColor: "#0b0f17",
-      chart: chartConfig(title, labels, values),
+      chart: chartConfigString(title, labels, values, colorByChange),
     }),
   });
 
-  if (!response.ok) {
-    throw new Error(`QuickChart HTTP ${response.status}`);
-  }
-
+  if (!response.ok) throw new Error(`QuickChart HTTP ${response.status}`);
   const image = await response.blob();
   const form = new FormData();
   form.append("chat_id", String(chatId));
   form.append("photo", image, "risk-manager-chart.png");
   form.append("caption", `📈 <b>${title}</b>\n${subtitle}`);
   form.append("parse_mode", "HTML");
+  if (backCallback) form.append("reply_markup", JSON.stringify({ inline_keyboard: [[{ text: "⬅️ Назад", callback_data: backCallback }]] }));
 
-  if (backCallback) {
-    form.append("reply_markup", JSON.stringify({
-      inline_keyboard: [[{ text: "⬅️ Назад", callback_data: backCallback }]],
-    }));
-  }
-
-  const tgResponse = await fetch(
-    `https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`,
-    { method: "POST", body: form }
-  );
+  const tgResponse = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`, { method: "POST", body: form });
   const data = await tgResponse.json().catch(() => ({}));
-  if (!tgResponse.ok || !data.ok) {
-    throw new Error(`Telegram sendPhoto: ${JSON.stringify(data)}`);
-  }
+  if (!tgResponse.ok || !data.ok) throw new Error(`Telegram sendPhoto: ${JSON.stringify(data)}`);
 }
 
 async function personalChartData(env, chatId) {
@@ -597,7 +608,8 @@ function valid(field, value) {
   const n = Number(String(value).replace(",", "."));
   if (!Number.isFinite(n)) return false;
 
-  if (field === "deposit" || field === "target") return n > 0;
+  if (field === "deposit") return Number.isInteger(n) && n >= 10 && n <= 10000;
+  if (field === "target") return n > 0;
   if (field === "winrate") return n >= 0 && n <= 100;
   if (field === "risk") return n > 0 && n <= 100;
   if (field === "tp") return n >= 0;
@@ -660,6 +672,7 @@ async function handleCallback(env, query) {
   await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
 
   if (data === "reset") {
+    await deleteCalcInputState(env, chatId).catch(()=>{});
     const s = cloneDefaults();
     return editMessage(env, chatId, messageId, settingsText(s), mainKeyboard(s));
   }
@@ -704,7 +717,7 @@ async function handleCallback(env, query) {
   if (data === "diary:chart:balance") {
     const d=await personalChartData(env,chatId);
     if(!d.count) return editMessage(env,chatId,messageId,"<b>📈 График депозита</b>\n\nСначала добавь хотя бы одну сделку.",diaryKeyboard());
-    await sendChartPhoto(env, chatId, "График баланса", "Фактические сделки · накопительный результат", d.labels, d.balance, "diary:menu");
+    await sendChartPhoto(env, chatId, "График баланса", "🟢 прибыльная сделка · 🔴 убыточная сделка", d.labels, d.balance, "diary:menu", true);
     return;
   }
 
@@ -721,13 +734,25 @@ async function handleCallback(env, query) {
     return;
   }
 
+  if (data.startsWith("deposit:custom:")) {
+    const s = unpackState(data.slice("deposit:custom:".length));
+    await saveCalcInputState(env, chatId, { step: "deposit", state: s });
+    return editMessage(env, chatId, messageId,
+      "✏️ <b>Ввод депозита</b>\n\nОтправь целое число от <b>$10</b> до <b>$10 000</b>.\nНапример: <code>347</code> или <code>1250</code>.",
+      { inline_keyboard: [[{ text: "❌ Отмена", callback_data: `back:${packState(s)}` }]] });
+  }
+
   // All menu/choice buttons carry the complete current state, so KV is not needed.
   if (data.startsWith("menu:")) {
     const [, menu, ...rest] = data.split(":");
     const s = unpackState(rest.join(":"));
 
-    if (menu === "deposit") return editMessage(env, chatId, messageId,
-      "💰 <b>Выбери депозит</b>", valueKeyboard("Депозит", "deposit", [50,100,250,500,1000], s));
+    if (menu === "deposit") {
+      const kb = valueKeyboard("Депозит", "deposit", [10,50,100,250,500,1000,5000,10000], s);
+      kb.inline_keyboard.splice(-1, 0, [{ text: "✏️ Ввести свой депозит", callback_data: `deposit:custom:${packState(s)}` }]);
+      return editMessage(env, chatId, messageId,
+        "💰 <b>Депозит</b>\n\nВыбери сумму или введи свою.\nДиапазон: <b>$10–$10 000</b>, с шагом $1.", kb);
+    }
     if (menu === "risk") return editMessage(env, chatId, messageId,
       "⚠️ <b>Риск на одну сделку</b>", valueKeyboard("Риск", "risk", [1,2,5,10,15,20], s));
     if (menu === "leverage") return editMessage(env, chatId, messageId,
@@ -795,7 +820,7 @@ async function handleCallback(env, query) {
   if (data.startsWith("calcchart:")) {
     const s=unpackState(data.slice("calcchart:".length));
     const d=calcChartData(s);
-    await sendChartPhoto(env, chatId, "График расчётного депозита", "Сценарий Risk Management · расчётные сделки", d.labels, d.values, `trades:0:${packState(s)}`);
+    await sendChartPhoto(env, chatId, "График расчётного депозита", "🟢 прибыльная сделка · 🔴 убыточная сделка", d.labels, d.values, `trades:0:${packState(s)}`, true);
     return;
   }
 
@@ -842,6 +867,21 @@ async function handleMessage(env, message) {
     if (diaryState.step === "pnl") { const n=Number(text.replace(",",".")); if(!Number.isFinite(n)) return sendMessage(env,chatId,"❌ Введи число, например <code>42.30</code> или <code>-18.50</code>.",diaryPromptKeyboard()); diaryState.pnl=n; diaryState.step="fee"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи комиссию сделки в $ (можно <code>0</code>):",diaryPromptKeyboard()); }
     if (diaryState.step === "fee") { const n=Number(text.replace(",",".")); if(!Number.isFinite(n)||n<0) return sendMessage(env,chatId,"❌ Введи комиссию числом, например <code>1.20</code>.",diaryPromptKeyboard()); diaryState.fee=n; diaryState.step="comment"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Комментарий к сделке или <code>-</code>, если без комментария:",diaryPromptKeyboard()); }
     if (diaryState.step === "comment") { diaryState.comment=text === "-" ? "" : text; await addDiaryTrade(env,chatId,diaryState); await deleteDiaryState(env,chatId); return sendMessage(env,chatId,"<b>✅ Сделка сохранена.</b>",diaryKeyboard()); }
+  }
+
+  const calcInputState = await getCalcInputState(env, chatId).catch(() => null);
+  if (calcInputState?.step === "deposit") {
+    const normalized = text.replace(/[$₽\s]/g, "").replace(",", ".");
+    const n = Number(normalized);
+    if (!Number.isInteger(n) || n < 10 || n > 10000) {
+      return sendMessage(env, chatId,
+        "❌ Неверная сумма. Введи <b>целое число от $10 до $10 000</b>.\nНапример: <code>347</code>.",
+        { inline_keyboard: [[{ text: "❌ Отмена", callback_data: `back:${packState(calcInputState.state || cloneDefaults())}` }]] });
+    }
+    const s = calcInputState.state || cloneDefaults();
+    s.deposit = n;
+    await deleteCalcInputState(env, chatId);
+    return sendMessage(env, chatId, settingsText(s), mainKeyboard(s));
   }
 
   const nums = parseNumbers(text);
