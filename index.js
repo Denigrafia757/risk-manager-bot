@@ -31,8 +31,8 @@ function diaryKeyboard() {
   return { inline_keyboard: [
     [{ text: "➕ Добавить сделку", callback_data: "diary:add" }],
     [{ text: "📖 Мои сделки", callback_data: "diary:list:0" }, { text: "📊 Статистика", callback_data: "diary:stats" }],
-    [{ text: "📈 График депозита", callback_data: "diary:chart:balance" }],
-    [{ text: "📊 График P/L", callback_data: "diary:chart:pnl" }],
+    [{ text: "💰 Стартовый баланс", callback_data: "diary:balance" }],
+    [{ text: "📈 График баланса", callback_data: "diary:chart:balance" }, { text: "📊 График P/L", callback_data: "diary:chart:pnl" }],
     [{ text: "📥 Скачать CSV", callback_data: "diary:csv" }],
     [{ text: "⬅️ К калькулятору", callback_data: "diary:back" }]
   ] };
@@ -119,6 +119,26 @@ async function deleteCalcInputState(env, chatId) {
   if (!env.DB) return;
   await ensureStateTable(env);
   await env.DB.prepare("DELETE FROM bot_state WHERE chat_id=? AND state_key=?").bind(String(chatId), `calc_input:${chatId}`).run();
+}
+
+async function getDiarySettings(env, chatId) {
+  await ensureStateTable(env);
+  const key = `diary_settings:${chatId}`;
+  const row = await env.DB.prepare("SELECT value FROM bot_state WHERE chat_id=? AND state_key=?").bind(String(chatId), key).first().catch(()=>null);
+  if (!row) return { startBalance: null };
+  try {
+    const x = JSON.parse(row.value);
+    const n = Number(x?.startBalance);
+    return { startBalance: Number.isFinite(n) && n > 0 ? n : null };
+  } catch { return { startBalance: null }; }
+}
+
+async function saveDiarySettings(env, chatId, settings) {
+  await ensureStateTable(env);
+  const key = `diary_settings:${chatId}`;
+  const startBalance = Number(settings.startBalance);
+  await env.DB.prepare("INSERT INTO bot_state(chat_id,state_key,value) VALUES(?,?,?) ON CONFLICT(chat_id,state_key) DO UPDATE SET value=excluded.value")
+    .bind(String(chatId), key, JSON.stringify({ startBalance })).run();
 }
 
 async function addDiaryTrade(env, chatId, state) {
@@ -251,10 +271,20 @@ async function sendChartPhoto(env, chatId, title, subtitle, labels, values, back
 async function personalChartData(env, chatId) {
   await ensureDiary(env);
   const r=await env.DB.prepare("SELECT id,created_at,pnl FROM trades WHERE chat_id=? ORDER BY id ASC").bind(String(chatId)).all();
-  let bal=0;
-  const balance=[0], pnl=[0], labels=["Старт"];
-  for(const x of (r.results||[])){ bal += Number(x.pnl)||0; balance.push(bal); pnl.push(Number(x.pnl)||0); labels.push(`#${x.id}`); }
-  return {balance,pnl,labels,tradePnl:(r.results||[]).map(x=>Number(x.pnl)||0),count:(r.results||[]).length};
+  const settings = await getDiarySettings(env, chatId);
+  const startBalance = Number(settings.startBalance || 0);
+  let bal=startBalance;
+  let cumulativePnl=0;
+  const balance=[startBalance], pnl=[0], labels=["Старт"];
+  for(const x of (r.results||[])){
+    const v=Number(x.pnl)||0;
+    bal += v;
+    cumulativePnl += v;
+    balance.push(bal);
+    pnl.push(cumulativePnl);
+    labels.push(`#${x.id}`);
+  }
+  return {balance,pnl,labels,tradePnl:(r.results||[]).map(x=>Number(x.pnl)||0),count:(r.results||[]).length,startBalance};
 }
 
 function calcChartData(s) {
@@ -263,9 +293,14 @@ function calcChartData(s) {
 
 async function diaryCsv(env, chatId) {
   await ensureDiary(env);
+  const settings = await getDiarySettings(env, chatId);
   const r = await env.DB.prepare("SELECT id,created_at,symbol,direction,entry,exit,leverage,volume,stop_pct,gross_pnl,pnl,fee,margin,comment FROM trades WHERE chat_id=? ORDER BY id ASC").bind(String(chatId)).all();
-  const lines = ["№;Дата;Инструмент;Направление;Вход;Выход;Плечо;Объём;Стоп %;Валовый P/L;Чистый P/L;Комиссия Bybit;Маржа;Комментарий"];
-  for (const x of (r.results||[])) lines.push([x.id,new Date(x.created_at).toLocaleString('ru-RU'),x.symbol,x.direction,x.entry,x.exit,x.leverage??'',x.volume??'',x.stop_pct??'',x.gross_pnl??'',x.pnl,x.fee,x.margin??'',x.comment].map(csvEscape).join(';'));
+  const lines = ["№;Дата;Инструмент;Направление;Вход;Выход;Плечо;Объём;Стоп %;Валовый P/L;Чистый P/L;Комиссия Bybit;Маржа;Стартовый баланс;Баланс после сделки;Комментарий"];
+  let bal=Number(settings.startBalance||0);
+  for (const x of (r.results||[])) {
+    bal += Number(x.pnl)||0;
+    lines.push([x.id,new Date(x.created_at).toLocaleString('ru-RU'),x.symbol,x.direction,x.entry,x.exit,x.leverage??'',x.volume??'',x.stop_pct??'',x.gross_pnl??'',x.pnl,x.fee,x.margin??'',settings.startBalance??'',bal,x.comment].map(csvEscape).join(';'));
+  }
   return lines.join("\n");
 }
 
@@ -279,7 +314,11 @@ async function sendCsv(env, chatId, csv) {
   if (!response.ok || !data.ok) throw new Error(`Telegram sendDocument: ${JSON.stringify(data)}`);
 }
 
-function diaryTextMenu() { return ["<b>📓 МОЙ ТОРГОВЫЙ ДНЕВНИК</b>","","Здесь хранятся только твои сделки.","Можно добавлять сделки вручную, смотреть историю, статистику и скачивать CSV."].join("\n"); }
+async function diaryTextMenu(env, chatId) {
+  const settings = await getDiarySettings(env, chatId);
+  const balanceText = settings.startBalance ? `$${money(settings.startBalance)}` : "❗ не задан";
+  return ["<b>📓 МОЙ ТОРГОВЫЙ ДНЕВНИК</b>","",`💰 Стартовый баланс: <b>${balanceText}</b>`,"","Здесь хранятся только твои сделки.","Баланс на графике начинается именно с указанной суммы, а затем меняется на фактический P/L каждой сделки."].join("\n");
+}
 
 function diaryRowsText(rows, page, total) {
   if (!rows.length) return "<b>📖 Мои сделки</b>\n\nПока сделок нет. Нажми «➕ Добавить сделку».";
@@ -744,18 +783,18 @@ async function handleCallback(env, query) {
     // Do not rely on query.message.photo being present in the callback payload.
     try {
       await tg(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
-      return await sendMessage(env, chatId, diaryTextMenu(), diaryKeyboard());
+      return await sendMessage(env, chatId, await diaryTextMenu(env, chatId), diaryKeyboard());
     } catch (e) {
       console.error("CHART_BACK", e);
       // Fallback: edit the photo caption instead of attempting editMessageText.
       try {
         return await tg(env, "editMessageCaption", {
           chat_id: chatId, message_id: messageId,
-          caption: diaryTextMenu(), parse_mode: "HTML", reply_markup: diaryKeyboard()
+          caption: await diaryTextMenu(env, chatId), parse_mode: "HTML", reply_markup: diaryKeyboard()
         });
       } catch (e2) {
         console.error("CHART_BACK_FALLBACK", e2);
-        return sendMessage(env, chatId, diaryTextMenu(), diaryKeyboard());
+        return sendMessage(env, chatId, await diaryTextMenu(env, chatId), diaryKeyboard());
       }
     }
   }
@@ -800,7 +839,12 @@ async function handleCallback(env, query) {
   }
 
   if (data === "diary:menu") {
-    return editMessage(env, chatId, messageId, diaryTextMenu(), diaryKeyboard());
+    return editMessage(env, chatId, messageId, await diaryTextMenu(env, chatId), diaryKeyboard());
+  }
+
+  if (data === "diary:balance") {
+    await saveDiaryState(env, chatId, { step: "startBalance" });
+    return editMessage(env, chatId, messageId, "<b>💰 Стартовый баланс</b>\n\nВведи баланс, с которым ты начал вести дневник. Например: <code>50</code> или <code>125.50</code>\n\nЭта сумма станет первой точкой графика баланса.", diaryPromptKeyboard());
   }
 
   if (data === "diary:add") {
@@ -810,7 +854,7 @@ async function handleCallback(env, query) {
 
   if (data === "diary:cancel") {
     await deleteDiaryState(env, chatId);
-    return editMessage(env, chatId, messageId, diaryTextMenu(), diaryKeyboard());
+    return editMessage(env, chatId, messageId, await diaryTextMenu(env, chatId), diaryKeyboard());
   }
 
   if (data === "diary:back") {
@@ -832,15 +876,20 @@ async function handleCallback(env, query) {
 
   if (data === "diary:stats") {
     const x=await diaryStats(env,chatId);
+    const settings=await getDiarySettings(env,chatId);
+    const start=Number(settings.startBalance||0);
+    const current=start+Number(x.pnl||0);
+    const roi=start>0 ? Number(x.pnl||0)/start*100 : 0;
     const wr=(Number(x.wins)+Number(x.losses))?Number(x.wins)/(Number(x.wins)+Number(x.losses))*100:0;
-    return editMessage(env,chatId,messageId,["<b>📊 Статистика дневника</b>","",`Сделок: <b>${x.n}</b>`,`🟢 Прибыльных: <b>${x.wins}</b>`,`🔴 Убыточных: <b>${x.losses}</b>`,`Win Rate: <b>${wr.toFixed(1)}%</b>`,`Общий P/L: <b>${Number(x.pnl)>=0?"+":""}${money(x.pnl)}</b>`,`Комиссии: <b>${money(x.fee)}</b>`,`Средняя прибыль: <b>+${money(x.avg_win)}</b>`,`Средний убыток: <b>${money(x.avg_loss)}</b>`,"", "Все показатели считаются только по твоим сделкам."].join("\n"),diaryKeyboard());
+    return editMessage(env,chatId,messageId,["<b>📊 Статистика дневника</b>","",`💰 Стартовый баланс: <b>${start>0?money(start):"не задан"}</b>`,`💵 Текущий баланс: <b>${start>0?money(current):"—"}</b>`,`Доходность: <b>${start>0?(roi>=0?"+":"")+roi.toFixed(2)+"%":"—"}</b>`,"",`Сделок: <b>${x.n}</b>`,`🟢 Прибыльных: <b>${x.wins}</b>`,`🔴 Убыточных: <b>${x.losses}</b>`,`Win Rate: <b>${wr.toFixed(1)}%</b>`,`Общий P/L: <b>${Number(x.pnl)>=0?"+":""}${money(x.pnl)}</b>`,`Комиссии: <b>${money(x.fee)}</b>`,`Средняя прибыль: <b>+${money(x.avg_win)}</b>`,`Средний убыток: <b>${money(x.avg_loss)}</b>`,"", "Баланс = стартовый баланс + сумма фактического чистого P/L."].join("\n"),diaryKeyboard());
   }
 
   if (data === "diary:chart:balance") {
     const d=await personalChartData(env,chatId);
-    if(!d.count) return editMessage(env,chatId,messageId,"<b>📈 График депозита</b>\n\nСначала добавь хотя бы одну сделку.",diaryKeyboard());
+    if(!d.startBalance) return editMessage(env,chatId,messageId,"<b>📈 График баланса</b>\n\nСначала укажи стартовый баланс.",diaryKeyboard());
+    if(!d.count) return editMessage(env,chatId,messageId,"<b>📈 График баланса</b>\n\nСтартовый баланс задан, но сделок пока нет.",diaryKeyboard());
     try {
-      await sendChartPhoto(env, chatId, "График баланса", "🟢 прибыльная · 🔴 убыточная · нажми кнопку сделки для точного P/L", d.labels, d.balance, "diary:menu", true, d.tradePnl, "diary", null, 0);
+      await sendChartPhoto(env, chatId, "График баланса", `Старт $${money(d.startBalance)} · 🟢 прибыльная · 🔴 убыточная · нажми кнопку сделки для точного P/L`, d.labels, d.balance, "diary:menu", true, d.tradePnl, "diary", null, 0);
     } catch (e) {
       console.error("DIARY_BALANCE_CHART", e);
       await sendMessage(env, chatId, "❌ Не удалось построить график. Нажми кнопку ещё раз.", diaryKeyboard());
@@ -1015,7 +1064,7 @@ async function handleMessage(env, message) {
   }
 
   if (text === "/diary" || text === "мой дневник" || text === "дневник") {
-    return sendMessage(env, chatId, diaryTextMenu(), diaryKeyboard());
+    return sendMessage(env, chatId, await diaryTextMenu(env, chatId), diaryKeyboard());
   }
 
   if (text === "/calc") {
@@ -1027,10 +1076,17 @@ async function handleMessage(env, message) {
 
   const diaryState = await getDiaryState(env, chatId).catch(() => null);
   if (diaryState) {
-    const diarySteps = new Set(["symbol", "entry", "exit", "volume", "leverage", "stopPct", "comment"]);
+    const diarySteps = new Set(["startBalance", "symbol", "entry", "exit", "volume", "leverage", "stopPct", "comment"]);
     if (!diarySteps.has(diaryState.step)) {
       await deleteDiaryState(env, chatId);
       return sendMessage(env, chatId, diaryAddStartText(), diaryAddKeyboard());
+    }
+    if (diaryState.step === "startBalance") {
+      const n=Number(text.replace(",","."));
+      if(!(n>0) || n>100000000) return sendMessage(env,chatId,"❌ Введи положительный стартовый баланс до $100 000 000.",diaryPromptKeyboard());
+      await saveDiarySettings(env, chatId, { startBalance:n });
+      await deleteDiaryState(env, chatId);
+      return sendMessage(env,chatId,`<b>✅ Стартовый баланс сохранён: $${money(n)}</b>\n\nТеперь график баланса и статистика будут начинаться с этой суммы.`,diaryKeyboard());
     }
     if (diaryState.step === "symbol") { diaryState.symbol=text; diaryState.step="entry"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи <b>цену входа</b>:",diaryPromptKeyboard()); }
     if (diaryState.step === "entry") { const n=Number(text.replace(",",".")); if(!(n>0)) return sendMessage(env,chatId,"❌ Введи положительную цену входа.",diaryPromptKeyboard()); diaryState.entry=n; diaryState.step="exit"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи <b>цену выхода</b> (фактическая цена закрытия):",diaryPromptKeyboard()); }
