@@ -33,6 +33,7 @@ function diaryKeyboard() {
     [{ text: "📖 Мои сделки", callback_data: "diary:list:0" }, { text: "📊 Статистика", callback_data: "diary:stats" }],
     [{ text: "💰 Стартовый баланс", callback_data: "diary:balance" }],
     [{ text: "📈 График баланса", callback_data: "diary:chart:balance" }, { text: "📊 График P/L", callback_data: "diary:chart:pnl" }],
+    [{ text: "🔗 Bybit", callback_data: "diary:bybit" }],
     [{ text: "📥 Скачать CSV", callback_data: "diary:csv" }],
     [{ text: "⬅️ К калькулятору", callback_data: "diary:back" }]
   ] };
@@ -66,7 +67,8 @@ async function ensureDiary(env) {
   const cols = await env.DB.prepare("PRAGMA table_info(trades)").all();
   const have = new Set((cols.results || []).map(x => x.name));
   const additions = [
-    ["volume", "REAL"], ["stop_pct", "REAL"], ["gross_pnl", "REAL"], ["margin", "REAL"]
+    ["volume", "REAL"], ["stop_pct", "REAL"], ["gross_pnl", "REAL"], ["margin", "REAL"],
+    ["source", "TEXT DEFAULT 'manual'"], ["bybit_order_id", "TEXT"], ["bybit_updated_ms", "INTEGER"], ["status", "TEXT DEFAULT 'CLOSED'"], ["bybit_position_key", "TEXT"]
   ];
   for (const [name, type] of additions) {
     if (!have.has(name)) await env.DB.prepare(`ALTER TABLE trades ADD COLUMN ${name} ${type}`).run();
@@ -160,6 +162,140 @@ async function addDiaryTrade(env, chatId, state) {
   await env.DB.prepare("INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
     .bind(String(chatId), new Date().toISOString(), state.symbol.toUpperCase(), state.direction, entry, exit, leverage, netPnl, fee, String(state.comment||"").slice(0,500), volume, stopPct, grossPnl, margin).run();
   return { grossPnl, fee, netPnl, margin, closeNotional };
+}
+
+
+function bybitHex(buf) {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function bybitSign(secret, payload) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return bybitHex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload)));
+}
+
+async function bybitGet(env, path, params = {}) {
+  if (!env.BYBIT_API_KEY || !env.BYBIT_API_SECRET) throw new Error("BYBIT_API_KEY/BYBIT_API_SECRET missing");
+  const ts = Date.now().toString();
+  const recvWindow = "5000";
+  const qs = Object.entries(params).filter(([,v]) => v !== undefined && v !== null && v !== "").map(([k,v]) => [k, String(v)]);
+  qs.sort((a,b) => a[0].localeCompare(b[0]));
+  const query = new URLSearchParams(qs).toString();
+  const sign = await bybitSign(env.BYBIT_API_SECRET, ts + env.BYBIT_API_KEY + recvWindow + query);
+  const url = `https://api.bybit.com${path}?${query}`;
+  const r = await fetch(url, { headers: {
+    "X-BAPI-API-KEY": env.BYBIT_API_KEY,
+    "X-BAPI-TIMESTAMP": ts,
+    "X-BAPI-RECV-WINDOW": recvWindow,
+    "X-BAPI-SIGN": sign,
+    "X-BAPI-SIGN-TYPE": "2",
+  }});
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data.retCode !== 0) throw new Error(`Bybit ${r.status}: ${data.retMsg || "API error"}`);
+  return data.result || {};
+}
+
+async function ensureBybit(env) {
+  await ensureStateTable(env);
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS bybit_sync (chat_id TEXT PRIMARY KEY, last_ms INTEGER NOT NULL DEFAULT 0, connected_at TEXT, last_error TEXT DEFAULT '')`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS bybit_imports (chat_id TEXT NOT NULL, key TEXT NOT NULL, updated_ms INTEGER NOT NULL, PRIMARY KEY(chat_id,key))`).run();
+}
+
+async function bybitStatus(env, chatId) {
+  if (!env.BYBIT_API_KEY || !env.BYBIT_API_SECRET) return { connected:false, error:"В Cloudflare не заданы BYBIT_API_KEY и BYBIT_API_SECRET." };
+  await ensureBybit(env);
+  const row = await env.DB.prepare("SELECT last_ms,last_error,connected_at FROM bybit_sync WHERE chat_id=?").bind(String(chatId)).first().catch(()=>null);
+  return { connected:true, lastMs:Number(row?.last_ms||0), error:row?.last_error||"", connectedAt:row?.connected_at||"" };
+}
+
+
+async function syncBybitOpenPositions(env, chatId) {
+  const result = await bybitGet(env, "/v5/position/list", { category:"linear", settleCoin:"USDT", limit:200 });
+  const list = Array.isArray(result.list) ? result.list : [];
+  let opened = 0;
+  for (const x of list) {
+    const size = Math.abs(Number(x.size || 0));
+    if (!size) continue;
+    const symbol = String(x.symbol || "").toUpperCase();
+    const direction = x.side === "Sell" ? "SHORT" : "LONG";
+    const key = `${symbol}:${direction}`;
+    const entry = Number(x.avgPrice || x.entryPrice || 0);
+    const leverage = Number(x.leverage || 0) || null;
+    const volume = Number(x.positionValue || 0) || (entry * size);
+    const stopPct = Number(x.stopLoss || 0) && entry ? Math.abs((Number(x.stopLoss) - entry) / entry * 100) : null;
+    const existing = await env.DB.prepare("SELECT id FROM trades WHERE chat_id=? AND bybit_position_key=? AND status='OPEN' ORDER BY id DESC LIMIT 1").bind(String(chatId), key).first().catch(()=>null);
+    if (existing?.id) {
+      await env.DB.prepare("UPDATE trades SET entry=?,exit=?,leverage=?,volume=?,stop_pct=?,margin=? WHERE id=?")
+        .bind(entry, entry, leverage, volume, stopPct, leverage ? volume/leverage : null, existing.id).run();
+    } else {
+      await env.DB.prepare(`INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin,source,status,bybit_position_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(String(chatId), new Date(Number(x.createdTime || Date.now())).toISOString(), symbol, direction, entry, entry, leverage, 0, 0, "Открыто из Bybit", volume, stopPct, 0, leverage ? volume/leverage : null, "bybit", "OPEN", key).run();
+      opened++;
+    }
+  }
+  return { opened };
+}
+
+async function importBybitClosed(env, chatId) {
+  if (!env.BYBIT_API_KEY || !env.BYBIT_API_SECRET) return { imported:0 };
+  await ensureDiary(env); await ensureBybit(env);
+  const state = await env.DB.prepare("SELECT last_ms FROM bybit_sync WHERE chat_id=?").bind(String(chatId)).first().catch(()=>null);
+  const start = Math.max(0, Number(state?.last_ms || 0) - 120000);
+  const result = await bybitGet(env, "/v5/position/closed-pnl", { category:"linear", limit:100, ...(start ? {startTime:start} : {}) });
+  const list = Array.isArray(result.list) ? result.list : [];
+  let maxMs = Number(state?.last_ms || 0), imported = 0;
+  for (const x of list.reverse()) {
+    const updated = Number(x.updatedTime || x.createdTime || 0);
+    maxMs = Math.max(maxMs, updated);
+    if (!x.orderId || String(x.execType || "Trade") !== "Trade") continue;
+    const key = `${x.orderId}:${updated}:${x.closedSize || x.qty || ""}`;
+    const exists = await env.DB.prepare("SELECT 1 FROM bybit_imports WHERE chat_id=? AND key=?").bind(String(chatId), key).first().catch(()=>null);
+    if (exists) continue;
+    const direction = x.side === "Sell" ? "LONG" : "SHORT";
+    const entry = Number(x.avgEntryPrice || 0), exit = Number(x.avgExitPrice || 0);
+    const qty = Number(x.closedSize || x.qty || 0);
+    const volume = Number(x.cumEntryValue || (entry * qty) || 0);
+    const leverage = Number(x.leverage || 0) || null;
+    const pnl = Number(x.closedPnl || 0);
+    const fee = Number(x.openFee || 0) + Number(x.closeFee || 0);
+    const gross = pnl + fee;
+    const margin = leverage ? volume / leverage : null;
+    const positionKey = `${String(x.symbol || "").toUpperCase()}:${direction}`;
+    const openRow = await env.DB.prepare("SELECT id FROM trades WHERE chat_id=? AND bybit_position_key=? AND status='OPEN' ORDER BY id DESC LIMIT 1").bind(String(chatId), positionKey).first().catch(()=>null);
+    if (openRow?.id) {
+      await env.DB.prepare(`UPDATE trades SET exit=?,leverage=?,pnl=?,fee=?,volume=?,gross_pnl=?,margin=?,comment=?,source='bybit',bybit_order_id=?,bybit_updated_ms=?,status='CLOSED' WHERE id=?`)
+        .bind(exit, leverage, pnl, fee, volume, gross, margin, "Закрыто через Bybit", String(x.orderId), updated, openRow.id).run();
+    } else {
+      await env.DB.prepare(`INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin,source,bybit_order_id,bybit_updated_ms,status,bybit_position_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(String(chatId), new Date(updated || Date.now()).toISOString(), String(x.symbol || "").toUpperCase(), direction, entry, exit, leverage, pnl, fee, "Импортировано из Bybit", volume, null, gross, margin, "bybit", String(x.orderId), updated, "CLOSED", positionKey).run();
+    }
+    await env.DB.prepare("INSERT INTO bybit_imports(chat_id,key,updated_ms) VALUES(?,?,?)").bind(String(chatId), key, updated).run();
+    imported++;
+  }
+  await env.DB.prepare(`INSERT INTO bybit_sync(chat_id,last_ms,connected_at,last_error) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET last_ms=excluded.last_ms,last_error=''`)
+    .bind(String(chatId), maxMs, new Date().toISOString(), "").run();
+  return { imported, maxMs };
+}
+
+async function syncBybit(env, chatId, notify = true) {
+  try {
+    const open = await syncBybitOpenPositions(env, chatId);
+    const r = await importBybitClosed(env, chatId);
+    if (notify && (r.imported > 0 || open.opened > 0)) await sendMessage(env, chatId, `🔗 <b>Bybit синхронизация</b>\n\nОткрыто новых позиций: <b>${open.opened}</b>\nЗакрыто/импортировано сделок: <b>${r.imported}</b>.\nP/L и комиссии берутся из данных Bybit.`, diaryKeyboard());
+    return { ...r, opened: open.opened };
+  } catch (e) {
+    await ensureBybit(env).catch(()=>{});
+    await env.DB.prepare(`INSERT INTO bybit_sync(chat_id,last_ms,connected_at,last_error) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET last_error=excluded.last_error`)
+      .bind(String(chatId), 0, null, String(e.message || e).slice(0,500)).run().catch(()=>{});
+    throw e;
+  }
+}
+
+async function getBybitChatIds(env) {
+  if (!env.DB) return [];
+  await ensureBybit(env);
+  const r = await env.DB.prepare("SELECT chat_id FROM bybit_sync ORDER BY chat_id").all().catch(()=>({results:[]}));
+  return (r.results || []).map(x => String(x.chat_id));
 }
 
 async function diaryTrades(env, chatId, limit=DIARY_PAGE_SIZE, offset=0) {
@@ -847,6 +983,19 @@ async function handleCallback(env, query) {
     return editMessage(env, chatId, messageId, "<b>💰 Стартовый баланс</b>\n\nВведи баланс, с которым ты начал вести дневник. Например: <code>50</code> или <code>125.50</code>\n\nЭта сумма станет первой точкой графика баланса.", diaryPromptKeyboard());
   }
 
+  if (data === "diary:bybit") {
+    const st = await bybitStatus(env, chatId);
+    if (!st.connected) {
+      return editMessage(env, chatId, messageId, "<b>🔗 Подключение Bybit</b>\n\nAPI пока не настроен. Сначала добавь в Cloudflare Worker Secrets:\n<code>BYBIT_API_KEY</code>\n<code>BYBIT_API_SECRET</code>\n\n🔒 Ключ должен быть только <b>Read Only</b>, без прав на торговлю и вывод средств.\n\nПосле добавления нажми «🔗 Bybit» ещё раз.", diaryKeyboard());
+    }
+    try {
+      const r = await syncBybit(env, chatId, false);
+      return editMessage(env, chatId, messageId, `<b>🔗 Bybit подключён</b>\n\nСтатус: 🟢 работает\nНовых сделок при проверке: <b>${r.imported}</b>\n\nБот автоматически проверяет закрытые сделки Bybit и добавляет их в дневник.`, diaryKeyboard());
+    } catch (e) {
+      return editMessage(env, chatId, messageId, `<b>🔗 Bybit</b>\n\n🔴 Ошибка подключения:\n<code>${String(e.message || e).slice(0,400)}</code>\n\nПроверь API key/secret и права Read Only.`, diaryKeyboard());
+    }
+  }
+
   if (data === "diary:add") {
     await saveDiaryState(env, chatId, {step:"direction"});
     return editMessage(env, chatId, messageId, diaryAddStartText(), diaryAddKeyboard());
@@ -1175,6 +1324,13 @@ async function webhookInfo(env) {
 }
 
 export default {
+  async scheduled(event, env, ctx) {
+    const ids = await getBybitChatIds(env).catch(() => []);
+    for (const chatId of ids) {
+      try { await syncBybit(env, chatId, true); } catch (e) { console.error("BYBIT_CRON", chatId, e); }
+    }
+  },
+
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
