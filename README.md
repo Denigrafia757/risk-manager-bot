@@ -1,3 +1,5 @@
 # Risk Manager Telegram
 
-Personal Telegram risk manager with calculator, trading diary, statistics and charts.
+Калькулятор риск-менеджмента и личный торговый дневник для Telegram.
+
+Дневник сделки автоматически считает P/L и комиссию Bybit для Perpetual/Futures по базовой ставке VIP 0 Taker 0.055% на открытие и 0.055% на закрытие.

@@ -62,7 +62,15 @@ function diaryListKeyboard(page, total) {
 
 async function ensureDiary(env) {
   if (!env.DB) throw new Error("D1 binding DB is missing");
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, created_at TEXT NOT NULL, symbol TEXT NOT NULL, direction TEXT NOT NULL, entry REAL NOT NULL, exit REAL NOT NULL, leverage REAL, pnl REAL NOT NULL, fee REAL DEFAULT 0, comment TEXT DEFAULT '')`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, created_at TEXT NOT NULL, symbol TEXT NOT NULL, direction TEXT NOT NULL, entry REAL NOT NULL, exit REAL NOT NULL, leverage REAL, pnl REAL NOT NULL, fee REAL DEFAULT 0, comment TEXT DEFAULT '', volume REAL, stop_pct REAL, gross_pnl REAL, margin REAL)`).run();
+  const cols = await env.DB.prepare("PRAGMA table_info(trades)").all();
+  const have = new Set((cols.results || []).map(x => x.name));
+  const additions = [
+    ["volume", "REAL"], ["stop_pct", "REAL"], ["gross_pnl", "REAL"], ["margin", "REAL"]
+  ];
+  for (const [name, type] of additions) {
+    if (!have.has(name)) await env.DB.prepare(`ALTER TABLE trades ADD COLUMN ${name} ${type}`).run();
+  }
 }
 
 async function getDiaryState(env, chatId) {
@@ -115,13 +123,28 @@ async function deleteCalcInputState(env, chatId) {
 
 async function addDiaryTrade(env, chatId, state) {
   await ensureDiary(env);
-  await env.DB.prepare("INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment) VALUES(?,?,?,?,?,?,?,?,?,?)")
-    .bind(String(chatId), new Date().toISOString(), state.symbol.toUpperCase(), state.direction, Number(state.entry), Number(state.exit), Number(state.leverage)||null, Number(state.pnl), Number(state.fee)||0, String(state.comment||"").slice(0,500)).run();
+  const entry = Number(state.entry);
+  const exit = Number(state.exit);
+  const volume = Number(state.volume);
+  const leverage = Number(state.leverage);
+  const stopPct = Number(state.stopPct);
+  const qty = volume / entry;
+  const closeNotional = qty * exit;
+  const grossPnl = state.direction === "SHORT"
+    ? qty * (entry - exit)
+    : qty * (exit - entry);
+  // Bybit VIP 0 perpetual/futures taker: 0.055% on entry + 0.055% on exit.
+  const fee = volume * 0.00055 + closeNotional * 0.00055;
+  const netPnl = grossPnl - fee;
+  const margin = volume / leverage;
+  await env.DB.prepare("INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .bind(String(chatId), new Date().toISOString(), state.symbol.toUpperCase(), state.direction, entry, exit, leverage, netPnl, fee, String(state.comment||"").slice(0,500), volume, stopPct, grossPnl, margin).run();
+  return { grossPnl, fee, netPnl, margin, closeNotional };
 }
 
 async function diaryTrades(env, chatId, limit=DIARY_PAGE_SIZE, offset=0) {
   await ensureDiary(env);
-  const r = await env.DB.prepare("SELECT id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment FROM trades WHERE chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?").bind(String(chatId), limit, offset).all();
+  const r = await env.DB.prepare("SELECT id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin FROM trades WHERE chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?").bind(String(chatId), limit, offset).all();
   const c = await env.DB.prepare("SELECT COUNT(*) AS n FROM trades WHERE chat_id=?").bind(String(chatId)).first();
   return { rows:r.results||[], total:Number(c?.n||0) };
 }
@@ -240,9 +263,9 @@ function calcChartData(s) {
 
 async function diaryCsv(env, chatId) {
   await ensureDiary(env);
-  const r = await env.DB.prepare("SELECT id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment FROM trades WHERE chat_id=? ORDER BY id ASC").bind(String(chatId)).all();
-  const lines = ["№;Дата;Инструмент;Направление;Вход;Выход;Плечо;P/L;Комиссия;Комментарий"];
-  for (const x of (r.results||[])) lines.push([x.id,new Date(x.created_at).toLocaleString('ru-RU'),x.symbol,x.direction,x.entry,x.exit,x.leverage??'',x.pnl,x.fee,x.comment].map(csvEscape).join(';'));
+  const r = await env.DB.prepare("SELECT id,created_at,symbol,direction,entry,exit,leverage,volume,stop_pct,gross_pnl,pnl,fee,margin,comment FROM trades WHERE chat_id=? ORDER BY id ASC").bind(String(chatId)).all();
+  const lines = ["№;Дата;Инструмент;Направление;Вход;Выход;Плечо;Объём;Стоп %;Валовый P/L;Чистый P/L;Комиссия Bybit;Маржа;Комментарий"];
+  for (const x of (r.results||[])) lines.push([x.id,new Date(x.created_at).toLocaleString('ru-RU'),x.symbol,x.direction,x.entry,x.exit,x.leverage??'',x.volume??'',x.stop_pct??'',x.gross_pnl??'',x.pnl,x.fee,x.margin??'',x.comment].map(csvEscape).join(';'));
   return lines.join("\n");
 }
 
@@ -263,7 +286,7 @@ function diaryRowsText(rows, page, total) {
   const lines=[`<b>📖 Мои сделки</b>\nСтраница ${page+1}\n`];
   for (const x of rows) {
     const icon=Number(x.pnl)>=0?"🟢":"🔴";
-    lines.push(`<b>№${x.id} ${icon} ${x.symbol} ${x.direction}</b>`,`${new Date(x.created_at).toLocaleString('ru-RU')}`,`Вход: ${x.entry} → выход: ${x.exit}`,`Плечо: ${x.leverage??"—"}x | Комиссия: ${money(x.fee)}`,`P/L: <b>${Number(x.pnl)>=0?"+":""}${money(x.pnl)}</b>`,x.comment?`📝 ${x.comment}`:"","");
+    lines.push(`<b>№${x.id} ${icon} ${x.symbol} ${x.direction}</b>`,`${new Date(x.created_at).toLocaleString('ru-RU')}`,`Объём: ${x.volume!=null?money(x.volume):"—"}`,`Вход: ${x.entry} → выход: ${x.exit}`,`Плечо: ${x.leverage??"—"}x | Стоп: ${x.stop_pct!=null?x.stop_pct+"%":"—"}`,`Комиссия Bybit: ${money(x.fee)}`,`P/L: <b>${Number(x.pnl)>=0?"+":""}${money(x.pnl)}</b>`,x.comment?`📝 ${x.comment}`:"","");
   }
   return lines.join("\n");
 }
@@ -1004,13 +1027,18 @@ async function handleMessage(env, message) {
 
   const diaryState = await getDiaryState(env, chatId).catch(() => null);
   if (diaryState) {
-    if (diaryState.step === "symbol") { diaryState.symbol=text; diaryState.step="entry"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи цену входа:",diaryPromptKeyboard()); }
-    if (diaryState.step === "entry") { const n=Number(text.replace(",",".")); if(!(n>0)) return sendMessage(env,chatId,"❌ Введи положительную цену входа.",diaryPromptKeyboard()); diaryState.entry=n; diaryState.step="exit"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи цену выхода:",diaryPromptKeyboard()); }
-    if (diaryState.step === "exit") { const n=Number(text.replace(",",".")); if(!(n>0)) return sendMessage(env,chatId,"❌ Введи положительную цену выхода.",diaryPromptKeyboard()); diaryState.exit=n; diaryState.step="leverage"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи плечо, например <code>10</code>:",diaryPromptKeyboard()); }
-    if (diaryState.step === "leverage") { const n=Number(text.replace(",",".")); if(!(n>0)) return sendMessage(env,chatId,"❌ Введи положительное плечо.",diaryPromptKeyboard()); diaryState.leverage=n; diaryState.step="pnl"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи <b>чистый P/L</b> сделки. Например: <code>42.30</code> или <code>-18.50</code>",diaryPromptKeyboard()); }
-    if (diaryState.step === "pnl") { const n=Number(text.replace(",",".")); if(!Number.isFinite(n)) return sendMessage(env,chatId,"❌ Введи число, например <code>42.30</code> или <code>-18.50</code>.",diaryPromptKeyboard()); diaryState.pnl=n; diaryState.step="fee"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи комиссию сделки в $ (можно <code>0</code>):",diaryPromptKeyboard()); }
-    if (diaryState.step === "fee") { const n=Number(text.replace(",",".")); if(!Number.isFinite(n)||n<0) return sendMessage(env,chatId,"❌ Введи комиссию числом, например <code>1.20</code>.",diaryPromptKeyboard()); diaryState.fee=n; diaryState.step="comment"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Комментарий к сделке или <code>-</code>, если без комментария:",diaryPromptKeyboard()); }
-    if (diaryState.step === "comment") { diaryState.comment=text === "-" ? "" : text; await addDiaryTrade(env,chatId,diaryState); await deleteDiaryState(env,chatId); return sendMessage(env,chatId,"<b>✅ Сделка сохранена.</b>",diaryKeyboard()); }
+    const diarySteps = new Set(["symbol", "entry", "exit", "volume", "leverage", "stopPct", "comment"]);
+    if (!diarySteps.has(diaryState.step)) {
+      await deleteDiaryState(env, chatId);
+      return sendMessage(env, chatId, diaryAddStartText(), diaryAddKeyboard());
+    }
+    if (diaryState.step === "symbol") { diaryState.symbol=text; diaryState.step="entry"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи <b>цену входа</b>:",diaryPromptKeyboard()); }
+    if (diaryState.step === "entry") { const n=Number(text.replace(",",".")); if(!(n>0)) return sendMessage(env,chatId,"❌ Введи положительную цену входа.",diaryPromptKeyboard()); diaryState.entry=n; diaryState.step="exit"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи <b>цену выхода</b> (фактическая цена закрытия):",diaryPromptKeyboard()); }
+    if (diaryState.step === "exit") { const n=Number(text.replace(",",".")); if(!(n>0)) return sendMessage(env,chatId,"❌ Введи положительную цену выхода.",diaryPromptKeyboard()); diaryState.exit=n; diaryState.step="volume"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи <b>объём позиции в $</b>. Например: <code>500</code>",diaryPromptKeyboard()); }
+    if (diaryState.step === "volume") { const n=Number(text.replace(",",".")); if(!(n>0)) return sendMessage(env,chatId,"❌ Введи положительный объём позиции в $.",diaryPromptKeyboard()); diaryState.volume=n; diaryState.step="leverage"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи <b>плечо</b>, например <code>10</code>:",diaryPromptKeyboard()); }
+    if (diaryState.step === "leverage") { const n=Number(text.replace(",",".")); if(!(n>0)||n>1000) return sendMessage(env,chatId,"❌ Введи плечо от 0.1x до 1000x.",diaryPromptKeyboard()); diaryState.leverage=n; diaryState.step="stopPct"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи <b>стоп в %</b> от цены входа. Например: <code>2.5</code>",diaryPromptKeyboard()); }
+    if (diaryState.step === "stopPct") { const n=Number(text.replace(",",".")); if(!(n>0)||n>100) return sendMessage(env,chatId,"❌ Введи стоп от 0.01% до 100%.",diaryPromptKeyboard()); diaryState.stopPct=n; diaryState.step="comment"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Комментарий к сделке или <code>-</code>, если без комментария.\n\n💸 Комиссию вводить <b>не нужно</b> — бот сам посчитает её по стандартной ставке Bybit Taker 0.055% на вход и 0.055% на выход.",diaryPromptKeyboard()); }
+    if (diaryState.step === "comment") { diaryState.comment=text === "-" ? "" : text; const result=await addDiaryTrade(env,chatId,diaryState); await deleteDiaryState(env,chatId); const sign=result.netPnl>=0?"+":"-"; const stopPrice=diaryState.direction==="LONG" ? diaryState.entry*(1-diaryState.stopPct/100) : diaryState.entry*(1+diaryState.stopPct/100); return sendMessage(env,chatId,["<b>✅ Сделка сохранена</b>","",`📦 Объём: <b>${money(diaryState.volume)}</b>`,`💵 Валовый P/L: <b>${result.grossPnl>=0?"+":"-"}${money(Math.abs(result.grossPnl))}</b>`,`💸 Комиссия Bybit: <b>${money(result.fee)}</b>`,`💰 Чистый P/L: <b>${sign}${money(Math.abs(result.netPnl))}</b>`,`🔧 Маржа: <b>${money(result.margin)}</b>`,`🛑 Стоп ${diaryState.stopPct}% → ориентир ${money(stopPrice)}`].join("\n"),diaryKeyboard()); }
   }
 
   const calcInputState = await getCalcInputState(env, chatId).catch(() => null);
