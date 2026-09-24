@@ -135,83 +135,91 @@ async function diaryStats(env, chatId) {
 function csvEscape(v) { return `"${String(v ?? "").replace(/"/g,'""')}"`; }
 
 
-function chartConfig(title, labels, values, colorByChange = false, tradePnl = []) {
-  const pnl = Array.isArray(tradePnl) ? tradePnl.map(Number) : [];
-  const hasPnl = pnl.length === Math.max(0, values.length - 1);
-  const chartLabels = hasPnl ? labels.map((label, i) => i === 0 ? label : `${label} ${pnl[i-1] >= 0 ? "+" : "-"}$${Math.abs(pnl[i-1]).toFixed(2)}`) : labels;
+function chartConfig(title, labels, values, colorByChange = false) {
   const baseOptions = {
     responsive: false,
     animation: false,
     plugins: {
       legend: { display: false },
       title: { display: true, text: title, color: "#f8fafc", font: { size: 24, weight: "700" } },
+      tooltip: {
+        enabled: true,
+        displayColors: false,
+        titleColor: "#ffffff",
+        bodyColor: "#ffffff",
+        backgroundColor: "#111827",
+        callbacks: {
+          label: (ctx) => `Баланс: $${Number(ctx.parsed.y).toFixed(2)}`
+        }
+      }
     },
     scales: {
       x: { ticks: { color: "#ffffff", maxTicksLimit: 14, font: { size: 14, weight: "600" } }, grid: { color: "#263044" } },
-      y: { position: "left", ticks: { color: "#ffffff", font: { size: 14, weight: "600" }, callback: (v) => "$" + Number(v).toFixed(0) }, grid: { color: "#263044" }, title: { display: true, text: "Баланс", color: "#ffffff" } },
-      ...(hasPnl ? { y1: { position: "right", grid: { drawOnChartArea: false }, ticks: { color: "#ffffff", font: { size: 14, weight: "600" }, callback: (v) => (v >= 0 ? "+$" : "-$") + Math.abs(Number(v)).toFixed(0) }, title: { display: true, text: "P/L сделки", color: "#ffffff" } } } : {}),
-    },
+      y: { position: "left", ticks: { color: "#ffffff", font: { size: 14, weight: "600" }, callback: (v) => "$" + Number(v).toFixed(0) }, grid: { color: "#263044" }, title: { display: true, text: "Баланс", color: "#ffffff" } }
+    }
   };
 
   const datasets = [];
   if (!colorByChange) {
-    datasets.push({
-      type: "line", label: title, data: values, yAxisID: "y",
-      borderColor: "#22c55e", backgroundColor: "transparent", borderWidth: 4,
-      pointRadius: values.length > 60 ? 0 : 4, pointHoverRadius: 6,
-      pointBackgroundColor: "#22c55e", pointBorderColor: "#22c55e", fill: false, tension: 0.12,
-    });
+    datasets.push({ type: "line", label: title, data: values, yAxisID: "y", borderColor: "#22c55e", backgroundColor: "transparent", borderWidth: 4, pointRadius: values.length > 60 ? 0 : 5, pointHoverRadius: 8, pointBackgroundColor: "#22c55e", pointBorderColor: "#22c55e", fill: false, tension: 0.12 });
   } else {
     for (let i = 0; i < Math.max(0, values.length - 1); i++) {
       const up = Number(values[i + 1]) >= Number(values[i]);
       const color = up ? "#22c55e" : "#ef4444";
       const segmentData = values.map(() => null);
       segmentData[i] = values[i]; segmentData[i + 1] = values[i + 1];
-      datasets.push({ type: "line", label: "", data: segmentData, yAxisID: "y", borderColor: color, backgroundColor: "transparent", borderWidth: 4, pointRadius: values.length > 60 ? 0 : 4, pointHoverRadius: 6, pointBackgroundColor: color, pointBorderColor: color, fill: false, tension: 0.12, spanGaps: false });
+      datasets.push({ type: "line", label: "", data: segmentData, yAxisID: "y", borderColor: color, backgroundColor: "transparent", borderWidth: 4, pointRadius: values.length > 60 ? 0 : 5, pointHoverRadius: 8, pointBackgroundColor: color, pointBorderColor: color, fill: false, tension: 0.12, spanGaps: false });
     }
-    if (!datasets.length) datasets.push({ type: "line", label: title, data: values, yAxisID: "y", borderColor: "#22c55e", borderWidth: 4, pointRadius: 4, pointBackgroundColor: "#22c55e", pointBorderColor: "#22c55e", fill: false, tension: 0.12 });
+    if (!datasets.length) datasets.push({ type: "line", label: title, data: values, yAxisID: "y", borderColor: "#22c55e", borderWidth: 4, pointRadius: 5, pointBackgroundColor: "#22c55e", pointBorderColor: "#22c55e", fill: false, tension: 0.12 });
   }
-
-  if (hasPnl) {
-    const barData = [null, ...pnl];
-    const barColors = ["transparent", ...pnl.map(v => Number(v) >= 0 ? "rgba(34,197,94,0.78)" : "rgba(239,68,68,0.78)")];
-    datasets.push({
-      type: "bar", label: "P/L сделки", data: barData, yAxisID: "y1",
-      backgroundColor: barColors, borderColor: barColors, borderWidth: 1, borderRadius: 4,
-      barPercentage: 0.72, categoryPercentage: 0.82,
-    });
-  }
-
-  return { type: "bar", data: { labels: chartLabels, datasets }, options: baseOptions };
+  return { type: "line", data: { labels, datasets }, options: baseOptions };
 }
 
-function chartConfigString(title, labels, values, colorByChange = false, tradePnl = []) {
-  return JSON.stringify(chartConfig(title, labels, values, colorByChange, tradePnl));
+function chartConfigString(title, labels, values, colorByChange = false) {
+  return JSON.stringify(chartConfig(title, labels, values, colorByChange));
 }
 
-async function sendChartPhoto(env, chatId, title, subtitle, labels, values, backCallback, colorByChange = false, tradePnl = []) {
+function chartTradeKeyboard(kind, tradePnl, page = 0, state = null) {
+  const pnl = Array.isArray(tradePnl) ? tradePnl : [];
+  const pageSize = 10;
+  const pages = Math.max(1, Math.ceil(pnl.length / pageSize));
+  const safePage = Math.min(Math.max(0, Number(page) || 0), pages - 1);
+  const from = safePage * pageSize;
+  const rows = [];
+  for (let i = from; i < Math.min(from + pageSize, pnl.length); i += 2) {
+    const row = [];
+    for (let j = i; j < Math.min(i + 2, Math.min(from + pageSize, pnl.length)); j++) {
+      const v = Number(pnl[j]) || 0;
+      const icon = v >= 0 ? "🟢" : "🔴";
+      const text = `${icon} #${j + 1} ${v >= 0 ? "+" : ""}$${v.toFixed(2)}`;
+      const callback_data = kind === "calc" ? `calcpt:${j}` : `diarypt:${j}`;
+      row.push({ text, callback_data });
+    }
+    rows.push(row);
+  }
+  const nav = [];
+  if (safePage > 0) nav.push({ text: "⬅️ Сделки", callback_data: `chartpage:${kind}:${safePage - 1}` });
+  nav.push({ text: `📄 ${safePage + 1}/${pages}`, callback_data: `chartpage:${kind}:${safePage}` });
+  if (safePage < pages - 1) nav.push({ text: "Сделки ➡️", callback_data: `chartpage:${kind}:${safePage + 1}` });
+  rows.push(nav);
+  rows.push([{ text: "⬅️ Назад", callback_data: "chart:back" }]);
+  return { inline_keyboard: rows };
+}
+
+async function sendChartPhoto(env, chatId, title, subtitle, labels, values, backCallback, colorByChange = false, tradePnl = [], kind = "diary", state = null, tradePage = 0) {
   const response = await fetch("https://quickchart.io/chart", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      width: 1100,
-      height: 900,
-      format: "png",
-      version: "4",
-      backgroundColor: "#0b0f17",
-      chart: chartConfigString(title, labels, values, colorByChange, tradePnl),
-    }),
+    body: JSON.stringify({ width: 1100, height: 900, format: "png", version: "4", backgroundColor: "#0b0f17", chart: chartConfigString(title, labels, values, colorByChange) })
   });
-
   if (!response.ok) throw new Error(`QuickChart HTTP ${response.status}`);
   const image = await response.blob();
   const form = new FormData();
   form.append("chat_id", String(chatId));
   form.append("photo", image, "risk-manager-chart.png");
-  form.append("caption", `📈 <b>${title}</b>\n${subtitle}`);
+  form.append("caption", `📈 <b>${title}</b>\n${subtitle}\n\n👆 Нажми кнопку сделки ниже — увидишь точный P/L.`);
   form.append("parse_mode", "HTML");
-  if (backCallback) form.append("reply_markup", JSON.stringify({ inline_keyboard: [[{ text: "⬅️ Назад", callback_data: backCallback }]] }));
-
+  form.append("reply_markup", JSON.stringify(chartTradeKeyboard(kind, tradePnl, tradePage, state)));
   const tgResponse = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`, { method: "POST", body: form });
   const data = await tgResponse.json().catch(() => ({}));
   if (!tgResponse.ok || !data.ok) throw new Error(`Telegram sendPhoto: ${JSON.stringify(data)}`);
@@ -698,7 +706,9 @@ async function handleCallback(env, query) {
   const messageId = query.message.message_id;
   const data = query.data || "";
 
-  await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+  if (!data.startsWith("calcpt:") && !data.startsWith("diarypt:")) {
+    await tg(env, "answerCallbackQuery", { callback_query_id: query.id });
+  }
 
   if (data === "reset") {
     await deleteCalcInputState(env, chatId).catch(()=>{});
@@ -706,13 +716,67 @@ async function handleCallback(env, query) {
     return editMessage(env, chatId, messageId, settingsText(s), mainKeyboard(s));
   }
 
-  if (data === "diary:menu") {
-    // The chart is sent as a photo, so Telegram cannot edit it with editMessageText.
-    // Remove the chart message and return to the diary menu as a normal text message.
-    if (query.message.photo) {
-      await tg(env, "deleteMessage", { chat_id: chatId, message_id: messageId }).catch(() => {});
-      return sendMessage(env, chatId, diaryTextMenu(), diaryKeyboard());
+  if (data === "chart:back") {
+    // Chart is a photo message. Delete it first, then send a fresh diary menu.
+    // Do not rely on query.message.photo being present in the callback payload.
+    try {
+      await tg(env, "deleteMessage", { chat_id: chatId, message_id: messageId });
+      return await sendMessage(env, chatId, diaryTextMenu(), diaryKeyboard());
+    } catch (e) {
+      console.error("CHART_BACK", e);
+      // Fallback: edit the photo caption instead of attempting editMessageText.
+      try {
+        return await tg(env, "editMessageCaption", {
+          chat_id: chatId, message_id: messageId,
+          caption: diaryTextMenu(), parse_mode: "HTML", reply_markup: diaryKeyboard()
+        });
+      } catch (e2) {
+        console.error("CHART_BACK_FALLBACK", e2);
+        return sendMessage(env, chatId, diaryTextMenu(), diaryKeyboard());
+      }
     }
+  }
+
+  if (data.startsWith("chartpage:")) {
+    const parts = data.split(":");
+    const kind = parts[1];
+    const page = Math.max(0, Number(parts[2]) || 0);
+    try {
+      if (kind === "calc") {
+        const s = (await getCalcInputState(env, chatId)) || cloneDefaults();
+        const d = calcChartData(s);
+        return tg(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: chartTradeKeyboard("calc", d.tradePnl, page, null) });
+      }
+      const d = await personalChartData(env, chatId);
+      return tg(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: chartTradeKeyboard("diary", d.tradePnl, page, null) });
+    } catch (e) {
+      console.error("CHART_PAGE", e);
+      return;
+    }
+  }
+
+  if (data.startsWith("calcpt:")) {
+    const parts = data.split(":");
+    const index = Math.max(0, Number(parts[1]) || 0);
+    const s = (await getCalcInputState(env, chatId)) || cloneDefaults();
+    const calc = calculate(s);
+    const row = calc.rows[index];
+    if (!row) return;
+    const sign = Number(row.net) >= 0 ? "+" : "-";
+    return tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: `Сделка №${row.n}\nP/L: ${sign}$${Math.abs(Number(row.net)).toFixed(2)}\nДепозит после: $${Number(row.after).toFixed(2)}`, show_alert: true });
+  }
+
+  if (data.startsWith("diarypt:")) {
+    const index = Math.max(0, Number(data.split(":")[1]) || 0);
+    const d = await personalChartData(env, chatId);
+    if (index >= d.tradePnl.length) return;
+    const v = Number(d.tradePnl[index]) || 0;
+    const after = Number(d.balance[index + 1]) || 0;
+    const sign = v >= 0 ? "+" : "-";
+    return tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: `Сделка №${index + 1}\nP/L: ${sign}$${Math.abs(v).toFixed(2)}\nБаланс после: $${after.toFixed(2)}`, show_alert: true });
+  }
+
+  if (data === "diary:menu") {
     return editMessage(env, chatId, messageId, diaryTextMenu(), diaryKeyboard());
   }
 
@@ -753,7 +817,7 @@ async function handleCallback(env, query) {
     const d=await personalChartData(env,chatId);
     if(!d.count) return editMessage(env,chatId,messageId,"<b>📈 График депозита</b>\n\nСначала добавь хотя бы одну сделку.",diaryKeyboard());
     try {
-      await sendChartPhoto(env, chatId, "График баланса", "🟢 прибыльная · 🔴 убыточная · столбики показывают P/L каждой сделки", d.labels, d.balance, "diary:menu", true, d.tradePnl);
+      await sendChartPhoto(env, chatId, "График баланса", "🟢 прибыльная · 🔴 убыточная · нажми кнопку сделки для точного P/L", d.labels, d.balance, "diary:menu", true, d.tradePnl, "diary", null, 0);
     } catch (e) {
       console.error("DIARY_BALANCE_CHART", e);
       await sendMessage(env, chatId, "❌ Не удалось построить график. Нажми кнопку ещё раз.", diaryKeyboard());
@@ -765,7 +829,7 @@ async function handleCallback(env, query) {
     const d=await personalChartData(env,chatId);
     if(!d.count) return editMessage(env,chatId,messageId,"<b>📊 График P/L</b>\n\nСначала добавь хотя бы одну сделку.",diaryKeyboard());
     try {
-      await sendChartPhoto(env, chatId, "Кривая P/L", "Фактические сделки · накопительный P/L", d.labels, d.pnl, "diary:menu", false, d.tradePnl);
+      await sendChartPhoto(env, chatId, "Кривая P/L", "Фактические сделки · накопительный P/L", d.labels, d.pnl, "diary:menu", false, d.tradePnl, "diary", null, 0);
     } catch (e) {
       console.error("DIARY_PNL_CHART", e);
       await sendMessage(env, chatId, "❌ Не удалось построить график. Нажми кнопку ещё раз.", diaryKeyboard());
@@ -894,8 +958,9 @@ async function handleCallback(env, query) {
   if (data.startsWith("calcchart:")) {
     const s=unpackState(data.slice("calcchart:".length));
     const d=calcChartData(s);
+    await saveCalcInputState(env, chatId, s).catch(()=>{});
     try {
-      await sendChartPhoto(env, chatId, "График расчётного депозита", "🟢 прибыльная · 🔴 убыточная · столбики показывают P/L каждой сделки", d.labels, d.values, `trades:0:${packState(s)}`, true, d.tradePnl);
+      await sendChartPhoto(env, chatId, "График расчётного депозита", "🟢 прибыльная · 🔴 убыточная · нажми кнопку сделки для точного P/L", d.labels, d.values, `trades:0:${packState(s)}`, true, d.tradePnl, "calc", packState(s), 0);
     } catch (e) {
       console.error("CALC_CHART", e);
       await sendMessage(env, chatId, "❌ Не удалось построить график. Нажми кнопку ещё раз.", tradesKeyboard(s, 0, calculate(s).rows.length));
@@ -906,7 +971,7 @@ async function handleCallback(env, query) {
   if (data.startsWith("trades:")) {
     const parts = data.split(":");
     const page = Number(parts[1]);
-    const s = unpackState(parts.slice(2).join(":"));
+    const s = (await getCalcInputState(env, chatId)) || cloneDefaults();
     const calc = calculate(s);
     return editMessage(env, chatId, messageId, resultText(s, calc, page), tradesKeyboard(s, page, calc.rows.length));
   }
