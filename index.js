@@ -434,6 +434,7 @@ function csvEscape(v) { return `"${String(v ?? "").replace(/"/g,'""')}"`; }
 function chartConfig(title, labels, values, colorByChange = false, target = null) {
   const numericValues = values.map(Number).filter(Number.isFinite);
   const maxValue = numericValues.length ? Math.max(...numericValues) : 0;
+  const minValue = numericValues.length ? Math.min(...numericValues) : 0;
   const targetValue = Number(target);
   const scaleReference = Number.isFinite(targetValue) && targetValue > 0
     ? Math.max(maxValue, targetValue)
@@ -443,6 +444,20 @@ function chartConfig(title, labels, values, colorByChange = false, target = null
   const suggestedMax = scaleReference > 0
     ? scaleReference * 1.08
     : 100;
+
+  // Leave room below the lowest balance so loss labels under red points
+  // remain fully visible. The padding is based on the largest losing trade
+  // rather than forcing the chart to start at zero.
+  let suggestedMin;
+  if (colorByChange && values.length > 1) {
+    let maxLoss = 0;
+    for (let i = 1; i < values.length; i++) {
+      const tradePnl = Number(values[i]) - Number(values[i - 1]);
+      if (tradePnl < 0) maxLoss = Math.max(maxLoss, Math.abs(tradePnl));
+    }
+    const labelPadding = Math.max(20, maxLoss * 1.25);
+    suggestedMin = minValue - labelPadding;
+  }
 
   const baseOptions = {
     responsive: false,
@@ -465,7 +480,8 @@ function chartConfig(title, labels, values, colorByChange = false, target = null
       x: { ticks: { color: "#ffffff", maxTicksLimit: 14, font: { size: 14, weight: "600" } }, grid: { color: "#263044" } },
       y: {
         position: "left",
-        beginAtZero: true,
+        beginAtZero: false,
+        ...(Number.isFinite(suggestedMin) ? { suggestedMin } : {}),
         suggestedMax,
         ticks: { color: "#ffffff", font: { size: 14, weight: "600" }, callback: (v) => "$" + Number(v).toLocaleString("en-US", { maximumFractionDigits: 0 }) },
         grid: { color: "#263044" },
@@ -478,10 +494,14 @@ function chartConfig(title, labels, values, colorByChange = false, target = null
   // QuickChart's annotation plugin renders these as static labels, so no
   // client-side JavaScript callbacks are needed.
   const annotations = {};
+  let profitLabelStep = 0;
   if (colorByChange && values.length > 1) {
     for (let i = 1; i < values.length; i++) {
       const tradePnl = Number(values[i]) - Number(values[i - 1]);
       const profitable = tradePnl >= 0;
+      const profitYSteps = [18, 32, 46, 60, 74];
+      const profitYAdjust = -profitYSteps[profitLabelStep % profitYSteps.length];
+      if (profitable) profitLabelStep++;
       annotations[`trade_${i}`] = {
         type: "label",
         xValue: labels[i],
@@ -491,12 +511,12 @@ function chartConfig(title, labels, values, colorByChange = false, target = null
         backgroundColor: "transparent",
         borderWidth: 0,
         padding: 0,
-        font: { size: 14, weight: "700" },
+        font: { size: 7, weight: "700" },
         position: { x: "center", y: "center" },
-        // On a rising chart, move profit labels slightly left so they
-        // don't sit directly on top of the upward line segment.
+        // Profit labels are shifted left and arranged in a small vertical
+        // staircase so dense runs of winning trades do not overlap.
         xAdjust: profitable ? -28 : 0,
-        yAdjust: profitable ? -18 : 18,
+        yAdjust: profitable ? profitYAdjust : 14,
         textAlign: "center"
       };
     }
