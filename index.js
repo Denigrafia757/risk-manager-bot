@@ -431,7 +431,19 @@ async function diaryStats(env, chatId) {
 function csvEscape(v) { return `"${String(v ?? "").replace(/"/g,'""')}"`; }
 
 
-function chartConfig(title, labels, values, colorByChange = false) {
+function chartConfig(title, labels, values, colorByChange = false, target = null) {
+  const numericValues = values.map(Number).filter(Number.isFinite);
+  const maxValue = numericValues.length ? Math.max(...numericValues) : 0;
+  const targetValue = Number(target);
+  const scaleReference = Number.isFinite(targetValue) && targetValue > 0
+    ? Math.max(maxValue, targetValue)
+    : maxValue;
+  // Give the chart enough headroom to show the selected target (including
+  // the final trade that can move the balance above that target).
+  const suggestedMax = scaleReference > 0
+    ? scaleReference * 1.08
+    : 100;
+
   const baseOptions = {
     responsive: false,
     animation: false,
@@ -451,7 +463,14 @@ function chartConfig(title, labels, values, colorByChange = false) {
     },
     scales: {
       x: { ticks: { color: "#ffffff", maxTicksLimit: 14, font: { size: 14, weight: "600" } }, grid: { color: "#263044" } },
-      y: { position: "left", ticks: { color: "#ffffff", font: { size: 14, weight: "600" }, callback: (v) => "$" + Number(v).toFixed(0) }, grid: { color: "#263044" }, title: { display: true, text: "Баланс", color: "#ffffff" } }
+      y: {
+        position: "left",
+        beginAtZero: true,
+        suggestedMax,
+        ticks: { color: "#ffffff", font: { size: 14, weight: "600" }, callback: (v) => "$" + Number(v).toLocaleString("en-US", { maximumFractionDigits: 0 }) },
+        grid: { color: "#263044" },
+        title: { display: true, text: "Баланс", color: "#ffffff" }
+      }
     }
   };
 
@@ -471,8 +490,8 @@ function chartConfig(title, labels, values, colorByChange = false) {
   return { type: "line", data: { labels, datasets }, options: baseOptions };
 }
 
-function chartConfigString(title, labels, values, colorByChange = false) {
-  return JSON.stringify(chartConfig(title, labels, values, colorByChange));
+function chartConfigString(title, labels, values, colorByChange = false, target = null) {
+  return JSON.stringify(chartConfig(title, labels, values, colorByChange, target));
 }
 
 function chartTradeKeyboard(kind, tradePnl, page = 0, state = null) {
@@ -502,11 +521,11 @@ function chartTradeKeyboard(kind, tradePnl, page = 0, state = null) {
   return { inline_keyboard: rows };
 }
 
-async function sendChartPhoto(env, chatId, title, subtitle, labels, values, backCallback, colorByChange = false, tradePnl = [], kind = "diary", state = null, tradePage = 0) {
+async function sendChartPhoto(env, chatId, title, subtitle, labels, values, backCallback, colorByChange = false, tradePnl = [], kind = "diary", state = null, tradePage = 0, target = null) {
   const response = await fetch("https://quickchart.io/chart", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ width: 1100, height: 900, format: "png", version: "4", backgroundColor: "#0b0f17", chart: chartConfigString(title, labels, values, colorByChange) })
+    body: JSON.stringify({ width: 1100, height: 900, format: "png", version: "4", backgroundColor: "#0b0f17", chart: chartConfigString(title, labels, values, colorByChange, target) })
   });
   if (!response.ok) throw new Error(`QuickChart HTTP ${response.status}`);
   const image = await response.blob();
@@ -541,7 +560,16 @@ async function personalChartData(env, chatId) {
 }
 
 function calcChartData(s) {
-  const c=calculate(s); return {values:[Number(s.deposit),...c.rows.map(r=>Number(r.after))], labels:["Старт",...c.rows.map(r=>`#${r.n}`)], tradePnl:c.rows.map(r=>Number(r.net)||0)};
+  const c = calculate(s);
+  const values = [Number(s.deposit), ...c.rows.map(r => Number(r.after))];
+  return {
+    values,
+    labels: ["Старт", ...c.rows.map(r => `#${r.n}`)],
+    tradePnl: c.rows.map(r => Number(r.net) || 0),
+    finalDeposit: Number(c.finalDeposit),
+    target: Number(s.target),
+    tradeCount: c.rows.length,
+  };
 }
 
 async function diaryCsv(env, chatId) {
@@ -814,7 +842,12 @@ function calculate(s) {
   let wins = 0;
   let losses = 0;
 
-  for (let i = 0; i < 1000 && deposit > 0 && deposit < target; i++) {
+  // 1000 trades is not a calculation limit: the loop continues until the
+  // selected target is reached. The hard cap only prevents a pathological
+  // configuration from running forever. In normal scenarios the target is
+  // reached much earlier.
+  const maxTrades = 10000;
+  for (let i = 0; i < maxTrades && deposit > 0 && deposit < target; i++) {
     const result = pattern[i % pattern.length];
 
     const margin = deposit * Number(s.risk) / 100;
@@ -1336,7 +1369,7 @@ async function handleCallback(env, query) {
     const d=calcChartData(s);
     await saveCalcInputState(env, chatId, s).catch(()=>{});
     try {
-      await sendChartPhoto(env, chatId, "График расчётного депозита", "🟢 прибыльная · 🔴 убыточная · нажми кнопку сделки для точного P/L", d.labels, d.values, `trades:0:${packState(s)}`, true, d.tradePnl, "calc", packState(s), 0);
+      await sendChartPhoto(env, chatId, "График расчётного депозита", `Цель ${money(d.target)} · финал ${money(d.finalDeposit)} · ${d.tradeCount} сделок · 🟢 прибыльная · 🔴 убыточная`, d.labels, d.values, `trades:0:${packState(s)}`, true, d.tradePnl, "calc", packState(s), 0, d.target);
     } catch (e) {
       console.error("CALC_CHART", e);
       await sendMessage(env, chatId, "❌ Не удалось построить график. Нажми кнопку ещё раз.", tradesKeyboard(s, 0, calculate(s).rows.length));
