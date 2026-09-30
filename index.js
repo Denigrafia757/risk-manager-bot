@@ -513,10 +513,19 @@ function chartConfig(title, labels, values, colorByChange = false, target = null
         padding: 0,
         font: { size: 7, weight: "700" },
         position: { x: "center", y: "center" },
-        // Profit labels are shifted left and arranged in a small vertical
-        // staircase so dense runs of winning trades do not overlap.
-        xAdjust: profitable ? -28 : 0,
-        yAdjust: profitable ? profitYAdjust : 14,
+        // Keep profit labels in a clean, repeatable staircase to the upper-left
+        // of each point. The callout draws a thin leader line back to the
+        // exact trade point so it is always obvious which value belongs to it.
+        xAdjust: profitable ? -34 : 0,
+        yAdjust: profitable ? profitYAdjust : 16,
+        callout: {
+          display: true,
+          borderColor: "#64748b",
+          borderWidth: 1,
+          margin: 2,
+          side: 4,
+          position: "auto"
+        },
         textAlign: "center"
       };
     }
