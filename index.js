@@ -493,6 +493,9 @@ function chartConfig(title, labels, values, colorByChange = false, target = null
         padding: 0,
         font: { size: 14, weight: "700" },
         position: { x: "center", y: "center" },
+        // On a rising chart, move profit labels slightly left so they
+        // don't sit directly on top of the upward line segment.
+        xAdjust: profitable ? -28 : 0,
         yAdjust: profitable ? -18 : 18,
         textAlign: "center"
       };
