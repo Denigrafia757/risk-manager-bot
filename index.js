@@ -474,6 +474,35 @@ function chartConfig(title, labels, values, colorByChange = false, target = null
     }
   };
 
+  // Labels for every trade point: profit above the point, loss below it.
+  // QuickChart's annotation plugin renders these as static labels, so no
+  // client-side JavaScript callbacks are needed.
+  const annotations = {};
+  if (colorByChange && values.length > 1) {
+    for (let i = 1; i < values.length; i++) {
+      const tradePnl = Number(values[i]) - Number(values[i - 1]);
+      const profitable = tradePnl >= 0;
+      annotations[`trade_${i}`] = {
+        type: "label",
+        xValue: labels[i],
+        yValue: Number(values[i]),
+        content: `${profitable ? "+" : ""}$${tradePnl.toFixed(2)}`,
+        color: "#ffffff",
+        backgroundColor: "transparent",
+        borderWidth: 0,
+        padding: 0,
+        font: { size: 14, weight: "700" },
+        position: { x: "center", y: "center" },
+        yAdjust: profitable ? -18 : 18,
+        textAlign: "center"
+      };
+    }
+  }
+
+  baseOptions.plugins.annotation = {
+    annotations
+  };
+
   const datasets = [];
   if (!colorByChange) {
     datasets.push({ type: "line", label: title, data: values, yAxisID: "y", borderColor: "#22c55e", backgroundColor: "transparent", borderWidth: 4, pointRadius: values.length > 60 ? 0 : 5, pointHoverRadius: 8, pointBackgroundColor: "#22c55e", pointBorderColor: "#22c55e", fill: false, tension: 0.12 });
