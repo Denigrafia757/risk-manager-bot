@@ -61,7 +61,8 @@ function diaryListKeyboard(page, total, rows = []) {
   const keyboard = [nav];
   for (const x of rows) {
     const icon = Number(x.pnl) >= 0 ? "🟢" : "🔴";
-    keyboard.push([{ text: `🗑 №${x.id} ${icon} ${x.symbol} ${x.direction}`, callback_data: `diary:delete:${x.id}:${page}` }]);
+    const zero = Math.abs(Number(x.pnl) || 0) < 0.0000001;
+    keyboard.push([{ text: zero ? `🗑 Удалить нулевую №${x.id}` : `🗑 Удалить №${x.id} ${icon}`, callback_data: `diary:delete:${x.id}:${page}` }]);
   }
   keyboard.push([{ text: "📓 Дневник", callback_data: "diary:menu" }]);
   return { inline_keyboard: keyboard };
@@ -93,7 +94,7 @@ async function ensureDiary(env) {
   const have = new Set((cols.results || []).map(x => x.name));
   const additions = [
     ["volume", "REAL"], ["stop_pct", "REAL"], ["gross_pnl", "REAL"], ["margin", "REAL"],
-    ["source", "TEXT DEFAULT 'manual'"], ["bybit_order_id", "TEXT"], ["bybit_updated_ms", "INTEGER"], ["status", "TEXT DEFAULT 'CLOSED'"], ["bybit_position_key", "TEXT"]
+    ["source", "TEXT DEFAULT 'manual'"], ["bybit_order_id", "TEXT"], ["bybit_updated_ms", "INTEGER"], ["status", "TEXT DEFAULT 'CLOSED'"], ["bybit_position_key", "TEXT"], ["opened_at", "TEXT"], ["closed_at", "TEXT"], ["position_pct", "REAL"], ["risk_warning", "INTEGER DEFAULT 0"]
   ];
   for (const [name, type] of additions) {
     if (!have.has(name)) await env.DB.prepare(`ALTER TABLE trades ADD COLUMN ${name} ${type}`).run();
@@ -168,6 +169,35 @@ async function saveDiarySettings(env, chatId, settings) {
     .bind(String(chatId), key, JSON.stringify({ startBalance })).run();
 }
 
+async function diaryBalanceBefore(env, chatId) {
+  const settings = await getDiarySettings(env, chatId);
+  const start = Number(settings.startBalance || 0);
+  if (!(start > 0)) return null;
+  const row = await env.DB.prepare("SELECT COALESCE(SUM(pnl),0) AS pnl FROM trades WHERE chat_id=?").bind(String(chatId)).first().catch(()=>null);
+  return start + Number(row?.pnl || 0);
+}
+
+function formatDuration(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return "—";
+  const totalSec = Math.floor(n / 1000);
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const mins = Math.floor((totalSec % 3600) / 60);
+  const secs = totalSec % 60;
+  if (days) return `${days}д ${hours}ч`;
+  if (hours) return `${hours}ч ${mins}м`;
+  if (mins) return `${mins}м ${secs}с`;
+  return `${secs}с`;
+}
+
+function formatTradeTime(v) {
+  if (!v) return "—";
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString("ru-RU", { timeZone: "Europe/Moscow" });
+}
+
 async function addDiaryTrade(env, chatId, state) {
   await ensureDiary(env);
   const entry = Number(state.entry);
@@ -184,11 +214,16 @@ async function addDiaryTrade(env, chatId, state) {
   const fee = volume * 0.00055 + closeNotional * 0.00055;
   const netPnl = grossPnl - fee;
   const margin = volume / leverage;
-  await env.DB.prepare("INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-    .bind(String(chatId), new Date().toISOString(), state.symbol.toUpperCase(), state.direction, entry, exit, leverage, netPnl, fee, String(state.comment||"").slice(0,500), volume, stopPct, grossPnl, margin).run();
-  return { grossPnl, fee, netPnl, margin, closeNotional };
+  const openedAt = state.openedAt || new Date().toISOString();
+  const closedAt = new Date().toISOString();
+  const balanceBefore = await diaryBalanceBefore(env, chatId);
+  const positionPct = balanceBefore && balanceBefore > 0 ? (volume / balanceBefore) * 100 : null;
+  const riskWarning = positionPct != null && positionPct > 10 ? 1 : 0;
+  await env.DB.prepare(`INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin,source,status,opened_at,closed_at,position_pct,risk_warning) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(String(chatId), closedAt, state.symbol.toUpperCase(), state.direction, entry, exit, leverage, netPnl, fee,
+      String(state.comment||"").slice(0,500), volume, stopPct, grossPnl, margin, "manual", "CLOSED", openedAt, closedAt, positionPct, riskWarning).run();
+  return { grossPnl, fee, netPnl, margin, closeNotional, balanceBefore, positionPct, riskWarning, openedAt, closedAt };
 }
-
 
 function bybitHex(buf) {
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
@@ -337,8 +372,12 @@ async function syncBybitOpenPositions(env, chatId) {
       await env.DB.prepare("UPDATE trades SET entry=?,exit=?,leverage=?,volume=?,stop_pct=?,margin=? WHERE id=?")
         .bind(entry, entry, leverage, volume, stopPct, leverage ? volume/leverage : null, existing.id).run();
     } else {
-      await env.DB.prepare(`INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin,source,status,bybit_position_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .bind(String(chatId), new Date(Number(x.createdTime || Date.now())).toISOString(), symbol, direction, entry, entry, leverage, 0, 0, "Открыто из Bybit", volume, stopPct, 0, leverage ? volume/leverage : null, "bybit", "OPEN", key).run();
+      const openedAt = new Date(Number(x.createdTime || Date.now())).toISOString();
+      const balanceBefore = await diaryBalanceBefore(env, chatId);
+      const positionPct = balanceBefore && balanceBefore > 0 ? (volume / balanceBefore) * 100 : null;
+      const riskWarning = positionPct != null && positionPct > 10 ? 1 : 0;
+      await env.DB.prepare(`INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin,source,status,bybit_position_key,opened_at,position_pct,risk_warning) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(String(chatId), openedAt, symbol, direction, entry, entry, leverage, 0, 0, "Открыто из Bybit", volume, stopPct, 0, leverage ? volume/leverage : null, "bybit", "OPEN", key, openedAt, positionPct, riskWarning).run();
       opened++;
     }
   }
@@ -371,11 +410,16 @@ async function importBybitClosed(env, chatId) {
     const positionKey = `${String(x.symbol || "").toUpperCase()}:${direction}`;
     const openRow = await env.DB.prepare("SELECT id FROM trades WHERE chat_id=? AND bybit_position_key=? AND status='OPEN' ORDER BY id DESC LIMIT 1").bind(String(chatId), positionKey).first().catch(()=>null);
     if (openRow?.id) {
-      await env.DB.prepare(`UPDATE trades SET exit=?,leverage=?,pnl=?,fee=?,volume=?,gross_pnl=?,margin=?,comment=?,source='bybit',bybit_order_id=?,bybit_updated_ms=?,status='CLOSED' WHERE id=?`)
-        .bind(exit, leverage, pnl, fee, volume, gross, margin, "Закрыто через Bybit", String(x.orderId), updated, openRow.id).run();
+      await env.DB.prepare(`UPDATE trades SET exit=?,leverage=?,pnl=?,fee=?,volume=?,gross_pnl=?,margin=?,comment=?,source='bybit',bybit_order_id=?,bybit_updated_ms=?,status='CLOSED',closed_at=? WHERE id=?`)
+        .bind(exit, leverage, pnl, fee, volume, gross, margin, "Закрыто через Bybit", String(x.orderId), updated, new Date(updated || Date.now()).toISOString(), openRow.id).run();
     } else {
-      await env.DB.prepare(`INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin,source,bybit_order_id,bybit_updated_ms,status,bybit_position_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .bind(String(chatId), new Date(updated || Date.now()).toISOString(), String(x.symbol || "").toUpperCase(), direction, entry, exit, leverage, pnl, fee, "Импортировано из Bybit", volume, null, gross, margin, "bybit", String(x.orderId), updated, "CLOSED", positionKey).run();
+      const closedAt = new Date(updated || Date.now()).toISOString();
+      const openedAt = x.createdTime ? new Date(Number(x.createdTime)).toISOString() : closedAt;
+      const balanceBefore = await diaryBalanceBefore(env, chatId);
+      const positionPct = balanceBefore && balanceBefore > 0 ? (volume / balanceBefore) * 100 : null;
+      const riskWarning = positionPct != null && positionPct > 10 ? 1 : 0;
+      await env.DB.prepare(`INSERT INTO trades(chat_id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin,source,bybit_order_id,bybit_updated_ms,status,bybit_position_key,opened_at,closed_at,position_pct,risk_warning) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(String(chatId), closedAt, String(x.symbol || "").toUpperCase(), direction, entry, exit, leverage, pnl, fee, "Импортировано из Bybit", volume, null, gross, margin, "bybit", String(x.orderId), updated, "CLOSED", positionKey, openedAt, closedAt, positionPct, riskWarning).run();
     }
     await env.DB.prepare("INSERT INTO bybit_imports(chat_id,key,updated_ms) VALUES(?,?,?)").bind(String(chatId), key, updated).run();
     imported++;
@@ -409,7 +453,7 @@ async function getBybitChatIds(env) {
 
 async function diaryTrades(env, chatId, limit=DIARY_PAGE_SIZE, offset=0) {
   await ensureDiary(env);
-  const r = await env.DB.prepare("SELECT id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin,source,status FROM trades WHERE chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?").bind(String(chatId), limit, offset).all();
+  const r = await env.DB.prepare("SELECT id,created_at,symbol,direction,entry,exit,leverage,pnl,fee,comment,volume,stop_pct,gross_pnl,margin,source,status,opened_at,closed_at,position_pct,risk_warning FROM trades WHERE chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?").bind(String(chatId), limit, offset).all();
   const c = await env.DB.prepare("SELECT COUNT(*) AS n FROM trades WHERE chat_id=?").bind(String(chatId)).first();
   return { rows:r.results||[], total:Number(c?.n||0) };
 }
@@ -636,12 +680,12 @@ function calcChartData(s) {
 async function diaryCsv(env, chatId) {
   await ensureDiary(env);
   const settings = await getDiarySettings(env, chatId);
-  const r = await env.DB.prepare("SELECT id,created_at,symbol,direction,entry,exit,leverage,volume,stop_pct,gross_pnl,pnl,fee,margin,comment FROM trades WHERE chat_id=? ORDER BY id ASC").bind(String(chatId)).all();
-  const lines = ["№;Дата;Инструмент;Направление;Вход;Выход;Плечо;Объём;Стоп %;Валовый P/L;Чистый P/L;Комиссия Bybit;Маржа;Стартовый баланс;Баланс после сделки;Комментарий"];
+  const r = await env.DB.prepare("SELECT id,created_at,symbol,direction,entry,exit,leverage,volume,stop_pct,gross_pnl,pnl,fee,margin,opened_at,closed_at,position_pct,risk_warning,comment FROM trades WHERE chat_id=? ORDER BY id ASC").bind(String(chatId)).all();
+  const lines = ["№;Дата;Инструмент;Направление;Вход;Выход;Плечо;Объём;Стоп %;Валовый P/L;Чистый P/L;Комиссия Bybit;Маржа;Открытие;Закрытие;Удержание;Объём % от баланса;Повышенный риск;Стартовый баланс;Баланс после сделки;Комментарий"];
   let bal=Number(settings.startBalance||0);
   for (const x of (r.results||[])) {
     bal += Number(x.pnl)||0;
-    lines.push([x.id,new Date(x.created_at).toLocaleString('ru-RU'),x.symbol,x.direction,x.entry,x.exit,x.leverage??'',x.volume??'',x.stop_pct??'',x.gross_pnl??'',x.pnl,x.fee,x.margin??'',settings.startBalance??'',bal,x.comment].map(csvEscape).join(';'));
+    lines.push([x.id,formatTradeTime(x.created_at),x.symbol,x.direction,x.entry,x.exit,x.leverage??'',x.volume??'',x.stop_pct??'',x.gross_pnl??'',x.pnl,x.fee,x.margin??'',formatTradeTime(x.opened_at),formatTradeTime(x.closed_at),x.opened_at&&x.closed_at?formatDuration(new Date(x.closed_at).getTime()-new Date(x.opened_at).getTime()):'',x.position_pct!=null?Number(x.position_pct).toFixed(2):'',Number(x.risk_warning)===1?'ДА':'',settings.startBalance??'',bal,x.comment].map(csvEscape).join(';'));
   }
   return lines.join("\n");
 }
@@ -664,10 +708,29 @@ async function diaryTextMenu(env, chatId) {
 
 function diaryRowsText(rows, page, total) {
   if (!rows.length) return "<b>📖 Мои сделки</b>\n\nПока сделок нет. Нажми «➕ Добавить сделку».";
-  const lines=[`<b>📖 Мои сделки</b>\nСтраница ${page+1}\n<i>Нажми 🗑 под сделкой, чтобы удалить её.</i>\n`];
+  const lines=[`<b>📖 Мои сделки</b>\nСтраница ${page+1}\n<i>Нажми кнопку 🗑 под сделкой для удаления с подтверждением.</i>\n`];
   for (const x of rows) {
-    const icon=Number(x.pnl)>=0?"🟢":"🔴";
-    lines.push(`<b>№${x.id} ${icon} ${x.symbol} ${x.direction}</b>`,`${new Date(x.created_at).toLocaleString('ru-RU')}`,`Объём: ${x.volume!=null?money(x.volume):"—"}`,`Вход: ${x.entry} → выход: ${x.exit}`,`Плечо: ${x.leverage??"—"}x | Стоп: ${x.stop_pct!=null?x.stop_pct+"%":"—"}`,`Комиссия Bybit: ${money(x.fee)}`,`P/L: <b>${Number(x.pnl)>=0?"+":""}${money(x.pnl)}</b>`,x.comment?`📝 ${x.comment}`:"","");
+    const pnl = Number(x.pnl) || 0;
+    const icon=pnl>0?"🟢":pnl<0?"🔴":"⚪";
+    const opened = x.opened_at || x.created_at;
+    const closed = x.closed_at;
+    const duration = opened && closed ? formatDuration(new Date(closed).getTime()-new Date(opened).getTime()) : (String(x.status||"").toUpperCase()==="OPEN" ? "позиция открыта" : "—");
+    const risk = Number(x.risk_warning)===1 ? `\n⚠️ <b>ПОВЫШЕННЫЙ РИСК:</b> объём ${Number(x.position_pct||0).toFixed(1)}% от баланса (порог 10%)` : "";
+    const comment = x.comment && !["Открыто из Bybit","Закрыто через Bybit","Импортировано из Bybit"].includes(x.comment) ? `\n📝 Причина/комментарий: ${htmlEscape(x.comment)}` : "\n📝 Причина/комментарий: —";
+    lines.push(
+      `<b>№${x.id} ${icon} ${htmlEscape(x.symbol)} ${x.direction}</b>`,
+      `🕐 Открытие: ${formatTradeTime(opened)}`,
+      `🕐 Закрытие: ${closed ? formatTradeTime(closed) : "⏳ позиция открыта"}`,
+      `⏱ Удержание: <b>${duration}</b>`,
+      `📦 Объём позиции: <b>${x.volume!=null?money(x.volume):"—"}</b>${x.position_pct!=null?` (${Number(x.position_pct).toFixed(1)}% от баланса)`:""}`,
+      `💵 Вход: ${x.entry} → выход: ${x.exit}`,
+      `🔧 Плечо: ${x.leverage??"—"}x | Стоп: ${x.stop_pct!=null?x.stop_pct+"%":"—"}`,
+      `💸 Комиссия Bybit: ${money(x.fee)}`,
+      `💰 P/L: <b>${pnl>0?"+":""}${money(pnl)}</b>`,
+      comment,
+      risk,
+      ""
+    );
   }
   return lines.join("\n");
 }
@@ -1177,12 +1240,17 @@ async function handleCallback(env, query) {
 
   if (data.startsWith("diarypt:")) {
     const index = Math.max(0, Number(data.split(":")[1]) || 0);
-    const d = await personalChartData(env, chatId);
-    if (index >= d.tradePnl.length) return;
-    const v = Number(d.tradePnl[index]) || 0;
-    const after = Number(d.balance[index + 1]) || 0;
+    await ensureDiary(env);
+    const r = await env.DB.prepare("SELECT id,symbol,direction,volume,entry,exit,leverage,pnl,fee,comment,opened_at,closed_at,position_pct,risk_warning,status FROM trades WHERE chat_id=? ORDER BY id ASC LIMIT 1 OFFSET ?").bind(String(chatId), index).first().catch(()=>null);
+    if (!r) return tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Сделка не найдена.", show_alert: true });
+    const v = Number(r.pnl) || 0;
+    const after = Number((await personalChartData(env, chatId)).balance[index + 1] || 0);
     const sign = v >= 0 ? "+" : "-";
-    return tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: `Сделка №${index + 1}\nP/L: ${sign}$${Math.abs(v).toFixed(2)}\nБаланс после: $${after.toFixed(2)}`, show_alert: true });
+    const holding = r.opened_at && r.closed_at ? formatDuration(new Date(r.closed_at).getTime()-new Date(r.opened_at).getTime()) : (r.status === "OPEN" ? "позиция открыта" : "—");
+    const comment = r.comment && !["Открыто из Bybit","Закрыто через Bybit","Импортировано из Bybit"].includes(r.comment) ? r.comment : "—";
+    const warning = Number(r.risk_warning)===1 ? `\n⚠️ Риск: ${Number(r.position_pct||0).toFixed(1)}% от баланса` : "";
+    const text = `Сделка №${r.id} ${r.symbol} ${r.direction}\n📦 Объём: $${Number(r.volume||0).toFixed(2)}\n🔧 Плечо: ${r.leverage != null ? Number(r.leverage).toString() : "—"}x\n⏱ Удержание: ${holding}\nP/L: ${sign}$${Math.abs(v).toFixed(2)}\nБаланс после: $${after.toFixed(2)}\n📝 ${comment}${warning}`;
+    return tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: text.slice(0, 195), show_alert: true });
   }
 
   if (data === "diary:menu") {
@@ -1256,7 +1324,8 @@ async function handleCallback(env, query) {
     if (!row) return tg(env,"answerCallbackQuery",{callback_query_id:query.id,text:"Сделка уже удалена или не найдена.",show_alert:true});
     const icon=Number(row.pnl)>=0?"🟢":"🔴";
     const sourceText=row.source==="bybit"?"Bybit":"вручную";
-    return editMessage(env,chatId,messageId,`<b>🗑 Удалить сделку №${row.id}?</b>\n\n${icon} ${row.symbol} ${row.direction}\nP/L: <b>${Number(row.pnl)>=0?"+":""}${money(row.pnl)}</b>\nИсточник: ${sourceText}\n\nПосле удаления она исчезнет из статистики и графиков.`,diaryDeleteConfirmKeyboard(id,page));
+    const zeroText = Math.abs(Number(row.pnl)||0) < 0.0000001 ? "\n⚪ Это нулевая сделка — на итоговый P/L она не влияет." : "";
+    return editMessage(env,chatId,messageId,`<b>🗑 Удалить сделку №${row.id}?</b>\n\n${icon} ${row.symbol} ${row.direction}\nP/L: <b>${Number(row.pnl)>=0?"+":""}${money(row.pnl)}</b>\nИсточник: ${sourceText}${zeroText}\n\nПосле подтверждения сделка исчезнет из дневника, статистики и графиков.`,diaryDeleteConfirmKeyboard(id,page));
   }
 
   if (data.startsWith("diary:delconfirm:")) {
@@ -1474,7 +1543,7 @@ async function handleMessage(env, message) {
 
   const diaryState = await getDiaryState(env, chatId).catch(() => null);
   if (diaryState) {
-    const diarySteps = new Set(["startBalance", "symbol", "entry", "exit", "volume", "leverage", "stopPct", "comment"]);
+    const diarySteps = new Set(["startBalance", "symbol", "entry", "exit", "volume", "leverage", "stopPct", "openedAt", "comment"]);
     if (!diarySteps.has(diaryState.step)) {
       await deleteDiaryState(env, chatId);
       return sendMessage(env, chatId, diaryAddStartText(), diaryAddKeyboard());
@@ -1491,8 +1560,29 @@ async function handleMessage(env, message) {
     if (diaryState.step === "exit") { const n=Number(text.replace(",",".")); if(!(n>0)) return sendMessage(env,chatId,"❌ Введи положительную цену выхода.",diaryPromptKeyboard()); diaryState.exit=n; diaryState.step="volume"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи <b>объём позиции в $</b>. Например: <code>500</code>",diaryPromptKeyboard()); }
     if (diaryState.step === "volume") { const n=Number(text.replace(",",".")); if(!(n>0)) return sendMessage(env,chatId,"❌ Введи положительный объём позиции в $.",diaryPromptKeyboard()); diaryState.volume=n; diaryState.step="leverage"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи <b>плечо</b>, например <code>10</code>:",diaryPromptKeyboard()); }
     if (diaryState.step === "leverage") { const n=Number(text.replace(",",".")); if(!(n>0)||n>1000) return sendMessage(env,chatId,"❌ Введи плечо от 0.1x до 1000x.",diaryPromptKeyboard()); diaryState.leverage=n; diaryState.step="stopPct"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Введи <b>стоп в %</b> от цены входа. Например: <code>2.5</code>",diaryPromptKeyboard()); }
-    if (diaryState.step === "stopPct") { const n=Number(text.replace(",",".")); if(!(n>0)||n>100) return sendMessage(env,chatId,"❌ Введи стоп от 0.01% до 100%.",diaryPromptKeyboard()); diaryState.stopPct=n; diaryState.step="comment"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"Комментарий к сделке или <code>-</code>, если без комментария.\n\n💸 Комиссию вводить <b>не нужно</b> — бот сам посчитает её по стандартной ставке Bybit Taker 0.055% на вход и 0.055% на выход.",diaryPromptKeyboard()); }
-    if (diaryState.step === "comment") { diaryState.comment=text === "-" ? "" : text; const result=await addDiaryTrade(env,chatId,diaryState); await deleteDiaryState(env,chatId); const sign=result.netPnl>=0?"+":"-"; const stopPrice=diaryState.direction==="LONG" ? diaryState.entry*(1-diaryState.stopPct/100) : diaryState.entry*(1+diaryState.stopPct/100); return sendMessage(env,chatId,["<b>✅ Сделка сохранена</b>","",`📦 Объём: <b>${money(diaryState.volume)}</b>`,`💵 Валовый P/L: <b>${result.grossPnl>=0?"+":"-"}${money(Math.abs(result.grossPnl))}</b>`,`💸 Комиссия Bybit: <b>${money(result.fee)}</b>`,`💰 Чистый P/L: <b>${sign}${money(Math.abs(result.netPnl))}</b>`,`🔧 Маржа: <b>${money(result.margin)}</b>`,`🛑 Стоп ${diaryState.stopPct}% → ориентир ${money(stopPrice)}`].join("\n"),diaryKeyboard()); }
+    if (diaryState.step === "stopPct") { const n=Number(text.replace(",",".")); if(!(n>0)||n>100) return sendMessage(env,chatId,"❌ Введи стоп от 0.01% до 100%.",diaryPromptKeyboard()); diaryState.stopPct=n; diaryState.step="openedAt"; await saveDiaryState(env,chatId,diaryState); return sendMessage(env,chatId,"🕐 Время открытия сделки.\nФормат: <code>04.10.2026 17:30</code>\nИли <code>-</code>, если считать открытие с текущего момента.",diaryPromptKeyboard()); }
+    if (diaryState.step === "openedAt") {
+      if (text === "-") diaryState.openedAt = new Date().toISOString();
+      else {
+        const m = text.match(/^(\d{2})\.(\d{2})\.(\d{4})[ ,]+(\d{1,2}):(\d{2})$/);
+        if (!m) return sendMessage(env,chatId,"❌ Неверный формат. Пример: <code>04.10.2026 17:30</code> или <code>-</code>.",diaryPromptKeyboard());
+        const d = new Date(Number(m[3]), Number(m[2])-1, Number(m[1]), Number(m[4]), Number(m[5]), 0);
+        if (Number.isNaN(d.getTime())) return sendMessage(env,chatId,"❌ Не удалось распознать дату и время.",diaryPromptKeyboard());
+        diaryState.openedAt = d.toISOString();
+      }
+      diaryState.step="comment";
+      await saveDiaryState(env,chatId,diaryState);
+      return sendMessage(env,chatId,"📝 Почему открыл сделку / комментарий или <code>-</code>, если без комментария.\n\n💸 Комиссию вводить <b>не нужно</b> — бот сам посчитает её по стандартной ставке Bybit Taker 0.055% на вход и 0.055% на выход.",diaryPromptKeyboard());
+    }
+    if (diaryState.step === "comment") {
+      diaryState.comment=text === "-" ? "" : text;
+      const result=await addDiaryTrade(env,chatId,diaryState);
+      await deleteDiaryState(env,chatId);
+      const sign=result.netPnl>=0?"+":"-";
+      const stopPrice=diaryState.direction==="LONG" ? diaryState.entry*(1-diaryState.stopPct/100) : diaryState.entry*(1+diaryState.stopPct/100);
+      const riskLine = result.riskWarning ? `⚠️ <b>ПОВЫШЕННЫЙ РИСК:</b> объём ${result.positionPct.toFixed(1)}% от баланса. Порог: 10%.` : `🟢 Объём ${result.positionPct!=null?result.positionPct.toFixed(1)+"% от баланса":"—"} — ниже порога 10%.`;
+      return sendMessage(env,chatId,["<b>✅ Сделка сохранена</b>","",`🪙 Токен: <b>${htmlEscape(diaryState.symbol.toUpperCase())}</b>`,`📦 Объём: <b>${money(diaryState.volume)}</b>`,`💵 Валовый P/L: <b>${result.grossPnl>=0?"+":"-"}${money(Math.abs(result.grossPnl))}</b>`,`💸 Комиссия Bybit: <b>${money(result.fee)}</b>`,`💰 Чистый P/L: <b>${sign}${money(Math.abs(result.netPnl))}</b>`,`🔧 Маржа: <b>${money(result.margin)}</b>`,`🛑 Стоп ${diaryState.stopPct}% → ориентир ${money(stopPrice)}`,`⏱ Удержание: <b>${formatDuration(new Date(result.closedAt).getTime()-new Date(result.openedAt).getTime())}</b>`,riskLine].join("\n"),diaryKeyboard());
+    }
   }
 
   const calcInputState = await getCalcInputState(env, chatId).catch(() => null);
