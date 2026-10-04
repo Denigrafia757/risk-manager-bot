@@ -723,6 +723,7 @@ function diaryRowsText(rows, page, total) {
       `🕐 Закрытие: ${closed ? formatTradeTime(closed) : "⏳ позиция открыта"}`,
       `⏱ Удержание: <b>${duration}</b>`,
       `📦 Объём позиции: <b>${x.volume!=null?money(x.volume):"—"}</b>${x.position_pct!=null?` (${Number(x.position_pct).toFixed(1)}% от баланса)`:""}`,
+      `💰 Маржа в сделке: <b>${x.margin!=null?money(x.margin):"—"}</b>`,
       `💵 Вход: ${x.entry} → выход: ${x.exit}`,
       `🔧 Плечо: ${x.leverage??"—"}x | Стоп: ${x.stop_pct!=null?x.stop_pct+"%":"—"}`,
       `💸 Комиссия Bybit: ${money(x.fee)}`,
@@ -1241,7 +1242,7 @@ async function handleCallback(env, query) {
   if (data.startsWith("diarypt:")) {
     const index = Math.max(0, Number(data.split(":")[1]) || 0);
     await ensureDiary(env);
-    const r = await env.DB.prepare("SELECT id,symbol,direction,volume,entry,exit,leverage,pnl,fee,comment,opened_at,closed_at,position_pct,risk_warning,status FROM trades WHERE chat_id=? ORDER BY id ASC LIMIT 1 OFFSET ?").bind(String(chatId), index).first().catch(()=>null);
+    const r = await env.DB.prepare("SELECT id,symbol,direction,volume,entry,exit,leverage,pnl,fee,margin,comment,opened_at,closed_at,position_pct,risk_warning,status FROM trades WHERE chat_id=? ORDER BY id ASC LIMIT 1 OFFSET ?").bind(String(chatId), index).first().catch(()=>null);
     if (!r) return tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: "Сделка не найдена.", show_alert: true });
     const v = Number(r.pnl) || 0;
     const after = Number((await personalChartData(env, chatId)).balance[index + 1] || 0);
@@ -1249,7 +1250,7 @@ async function handleCallback(env, query) {
     const holding = r.opened_at && r.closed_at ? formatDuration(new Date(r.closed_at).getTime()-new Date(r.opened_at).getTime()) : (r.status === "OPEN" ? "позиция открыта" : "—");
     const comment = r.comment && !["Открыто из Bybit","Закрыто через Bybit","Импортировано из Bybit"].includes(r.comment) ? r.comment : "—";
     const warning = Number(r.risk_warning)===1 ? `\n⚠️ Риск: ${Number(r.position_pct||0).toFixed(1)}% от баланса` : "";
-    const text = `Сделка №${r.id} ${r.symbol} ${r.direction}\n📦 Объём: $${Number(r.volume||0).toFixed(2)}\n🔧 Плечо: ${r.leverage != null ? Number(r.leverage).toString() : "—"}x\n⏱ Удержание: ${holding}\nP/L: ${sign}$${Math.abs(v).toFixed(2)}\nБаланс после: $${after.toFixed(2)}\n📝 ${comment}${warning}`;
+    const text = `Сделка №${r.id} ${r.symbol} ${r.direction}\n📦 Объём: $${Number(r.volume||0).toFixed(2)}\n💰 Маржа: ${r.margin != null ? "$" + Number(r.margin).toFixed(2) : "—"}\n🔧 Плечо: ${r.leverage != null ? Number(r.leverage).toString() : "—"}x\n⏱ Удержание: ${holding}\nP/L: ${sign}$${Math.abs(v).toFixed(2)}\nБаланс после: $${after.toFixed(2)}\n📝 ${comment}${warning}`;
     return tg(env, "answerCallbackQuery", { callback_query_id: query.id, text: text.slice(0, 195), show_alert: true });
   }
 
