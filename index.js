@@ -60,6 +60,8 @@ function diaryListKeyboard(page, total, rows = []) {
   if (page < pages - 1) nav.push({ text: "Вперёд ➡️", callback_data: `diary:list:${page + 1}` });
   const keyboard = [nav];
   for (const x of rows) {
+    // Открытые позиции нельзя удалять: сначала они должны быть закрыты.
+    if (String(x.status || "").toUpperCase() === "OPEN") continue;
     const icon = Number(x.pnl) >= 0 ? "🟢" : "🔴";
     const zero = Math.abs(Number(x.pnl) || 0) < 0.0000001;
     keyboard.push([{ text: zero ? `🗑 Удалить нулевую №${x.id}` : `🗑 Удалить №${x.id} ${icon}`, callback_data: `diary:delete:${x.id}:${page}` }]);
@@ -461,7 +463,8 @@ async function diaryTrades(env, chatId, limit=DIARY_PAGE_SIZE, offset=0) {
 async function deleteDiaryTrade(env, chatId, id) {
   await ensureDiary(env);
   const row = await env.DB.prepare("SELECT id,symbol,direction,source,status FROM trades WHERE id=? AND chat_id=?").bind(Number(id), String(chatId)).first().catch(()=>null);
-  if (!row) return { ok:false };
+  if (!row) return { ok:false, reason:"not_found" };
+  if (String(row.status || "").toUpperCase() === "OPEN") return { ok:false, reason:"open" };
   await env.DB.prepare("DELETE FROM trades WHERE id=? AND chat_id=?").bind(Number(id), String(chatId)).run();
   return { ok:true, row };
 }
@@ -1323,6 +1326,9 @@ async function handleCallback(env, query) {
     const page=Math.max(0,Number(parts[3])||0);
     const row=await env.DB.prepare("SELECT id,symbol,direction,pnl,source,status FROM trades WHERE id=? AND chat_id=?").bind(id,String(chatId)).first().catch(()=>null);
     if (!row) return tg(env,"answerCallbackQuery",{callback_query_id:query.id,text:"Сделка уже удалена или не найдена.",show_alert:true});
+    if (String(row.status || "").toUpperCase() === "OPEN") {
+      return tg(env,"answerCallbackQuery",{callback_query_id:query.id,text:"Открытую сделку удалить нельзя. Сначала закрой позицию.",show_alert:true});
+    }
     const icon=Number(row.pnl)>=0?"🟢":"🔴";
     const sourceText=row.source==="bybit"?"Bybit":"вручную";
     const zeroText = Math.abs(Number(row.pnl)||0) < 0.0000001 ? "\n⚪ Это нулевая сделка — на итоговый P/L она не влияет." : "";
@@ -1334,7 +1340,10 @@ async function handleCallback(env, query) {
     const id=Number(parts[2]);
     const page=Math.max(0,Number(parts[3])||0);
     const result=await deleteDiaryTrade(env,chatId,id);
-    if (!result.ok) return tg(env,"answerCallbackQuery",{callback_query_id:query.id,text:"Сделка уже удалена или не найдена.",show_alert:true});
+    if (!result.ok) {
+      const msg = result.reason === "open" ? "Открытую сделку удалить нельзя. Сначала закрой позицию." : "Сделка уже удалена или не найдена.";
+      return tg(env,"answerCallbackQuery",{callback_query_id:query.id,text:msg,show_alert:true});
+    }
     const totalAfter=(await diaryTrades(env,chatId,1,0)).total;
     const safePage=totalAfter>0?Math.min(page,Math.max(0,Math.ceil(totalAfter/DIARY_PAGE_SIZE)-1)):0;
     const pageRows=await diaryTrades(env,chatId,DIARY_PAGE_SIZE,safePage*DIARY_PAGE_SIZE);
