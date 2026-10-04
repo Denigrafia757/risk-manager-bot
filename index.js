@@ -60,8 +60,16 @@ function diaryListKeyboard(page, total, rows = []) {
   if (page < pages - 1) nav.push({ text: "Вперёд ➡️", callback_data: `diary:list:${page + 1}` });
   const keyboard = [nav];
   for (const x of rows) {
+    const isOpen = String(x.status || "").toUpperCase() === "OPEN";
+    const isBybitOpen = isOpen && String(x.source || "").toLowerCase() === "bybit";
+
+    // Для открытой Bybit-позиции можно добавить причину/комментарий после открытия.
+    if (isBybitOpen) {
+      keyboard.push([{ text: `📝 Комментарий к №${x.id}`, callback_data: `diary:comment:${x.id}:${page}` }]);
+    }
+
     // Открытые позиции нельзя удалять: сначала они должны быть закрыты.
-    if (String(x.status || "").toUpperCase() === "OPEN") continue;
+    if (isOpen) continue;
     const icon = Number(x.pnl) >= 0 ? "🟢" : "🔴";
     const zero = Math.abs(Number(x.pnl) || 0) < 0.0000001;
     keyboard.push([{ text: zero ? `🗑 Удалить нулевую №${x.id}` : `🗑 Удалить №${x.id} ${icon}`, callback_data: `diary:delete:${x.id}:${page}` }]);
@@ -1320,6 +1328,21 @@ async function handleCallback(env, query) {
     return editMessage(env,chatId,messageId,diaryRowsText(result.rows,page,result.total),diaryListKeyboard(page,result.total,result.rows));
   }
 
+  if (data.startsWith("diary:comment:")) {
+    const parts = data.split(":");
+    const id = Number(parts[2]);
+    const page = Math.max(0, Number(parts[3]) || 0);
+    const row = await env.DB.prepare("SELECT id,symbol,direction,comment,status,source FROM trades WHERE id=? AND chat_id=?")
+      .bind(id, String(chatId)).first().catch(()=>null);
+    if (!row) return tg(env,"answerCallbackQuery",{callback_query_id:query.id,text:"Сделка не найдена.",show_alert:true});
+    if (String(row.status || "").toUpperCase() !== "OPEN" || String(row.source || "").toLowerCase() !== "bybit") {
+      return tg(env,"answerCallbackQuery",{callback_query_id:query.id,text:"Комментарий здесь можно добавить только к открытой сделке Bybit.",show_alert:true});
+    }
+    await saveDiaryState(env, chatId, { step: "bybitComment", tradeId: id, page });
+    const current = row.comment && !["Открыто из Bybit","Закрыто через Bybit","Импортировано из Bybit"].includes(row.comment) ? row.comment : "не задан";
+    return editMessage(env, chatId, messageId, `<b>📝 Комментарий к сделке №${row.id}</b>\n\n${htmlEscape(row.symbol)} ${htmlEscape(row.direction)}\nТекущий комментарий: <i>${htmlEscape(current)}</i>\n\nНапиши, почему ты открыл эту позицию. Можно написать, например: <code>Вход по пробою уровня</code>.\n\nЕсли комментарий не нужен — отправь <code>-</code>.`, diaryPromptKeyboard());
+  }
+
   if (data.startsWith("diary:delete:")) {
     const parts=data.split(":");
     const id=Number(parts[2]);
@@ -1553,11 +1576,34 @@ async function handleMessage(env, message) {
 
   const diaryState = await getDiaryState(env, chatId).catch(() => null);
   if (diaryState) {
-    const diarySteps = new Set(["startBalance", "symbol", "entry", "exit", "volume", "leverage", "stopPct", "openedAt", "comment"]);
+    const diarySteps = new Set(["startBalance", "symbol", "entry", "exit", "volume", "leverage", "stopPct", "openedAt", "comment", "bybitComment"]);
     if (!diarySteps.has(diaryState.step)) {
       await deleteDiaryState(env, chatId);
       return sendMessage(env, chatId, diaryAddStartText(), diaryAddKeyboard());
     }
+    if (diaryState.step === "bybitComment") {
+      const tradeId = Number(diaryState.tradeId);
+      const row = await env.DB.prepare("SELECT id,symbol,status,source FROM trades WHERE id=? AND chat_id=?")
+        .bind(tradeId, String(chatId)).first().catch(()=>null);
+      if (!row) {
+        await deleteDiaryState(env, chatId);
+        return sendMessage(env, chatId, "❌ Сделка не найдена. Возможно, она уже удалена.", diaryKeyboard());
+      }
+      if (String(row.status || "").toUpperCase() !== "OPEN" || String(row.source || "").toLowerCase() !== "bybit") {
+        await deleteDiaryState(env, chatId);
+        return sendMessage(env, chatId, "ℹ️ Сделка уже закрыта. Комментарий к этой позиции сейчас изменить нельзя.", diaryKeyboard());
+      }
+      const comment = text === "-" ? "" : text.slice(0, 500);
+      await env.DB.prepare("UPDATE trades SET comment=? WHERE id=? AND chat_id=? AND status='OPEN' AND source='bybit'")
+        .bind(comment, tradeId, String(chatId)).run();
+      await deleteDiaryState(env, chatId);
+      const page = Math.max(0, Number(diaryState.page) || 0);
+      const result = await diaryTrades(env, chatId, DIARY_PAGE_SIZE, page * DIARY_PAGE_SIZE);
+      const safePage = result.total > 0 ? Math.min(page, Math.max(0, Math.ceil(result.total / DIARY_PAGE_SIZE) - 1)) : 0;
+      const pageRows = safePage === page ? result : await diaryTrades(env, chatId, DIARY_PAGE_SIZE, safePage * DIARY_PAGE_SIZE);
+      return sendMessage(env, chatId, `✅ Комментарий к сделке №${tradeId} сохранён.`, diaryListKeyboard(safePage, pageRows.total, pageRows.rows));
+    }
+
     if (diaryState.step === "startBalance") {
       const n=Number(text.replace(",","."));
       if(!(n>0) || n>100000000) return sendMessage(env,chatId,"❌ Введи положительный стартовый баланс до $100 000 000.",diaryPromptKeyboard());
